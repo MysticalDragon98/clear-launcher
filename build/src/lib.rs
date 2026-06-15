@@ -1,13 +1,14 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = "clear-launcher";
 pub const SETTINGS_FILE: &str = "settings.yml";
+pub const CONFIG_FILE_NAME: &str = "config.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
@@ -27,6 +28,12 @@ pub struct LauncherPaths {
     pub linux: Option<String>,
     pub macos: Option<String>,
     pub windows: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LauncherConfig {
+    pub path_symlink: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +102,15 @@ pub fn execute(
         env_get,
         stdout,
         fetch_fabric_loader_versions,
-        install_minecraft_version,
+        |launcher_root, versions_folder, request| {
+            install_minecraft_version_with_alias(
+                launcher_root,
+                versions_folder,
+                &request.requested_version,
+                request.alias.as_deref(),
+            )
+        },
+        current_exe_path,
     )
 }
 
@@ -105,7 +120,8 @@ fn execute_with_services(
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
     fetch_versions: impl FnOnce() -> Result<Vec<String>>,
-    install_version: impl FnOnce(&Path, &Path, &str) -> Result<InstalledVersion>,
+    install_version: impl FnOnce(&Path, &Path, &InstallRequest) -> Result<InstalledVersion>,
+    current_exe: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<()> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
@@ -124,15 +140,13 @@ fn execute_with_services(
             write_versions(&versions, stdout)
         }
         Some("install") => {
-            let requested = args.next().with_context(|| {
+            let requested_version = args.next().with_context(|| {
                 format!(
                     "missing version for `install`\n\n{}",
                     usage_text(DEFAULT_CLI_NAME)
                 )
             })?;
-            if let Some(extra) = args.next() {
-                bail!("unexpected argument for `install`: `{extra}`");
-            }
+            let install_request = parse_install_request(requested_version, args)?;
 
             let settings_context = load_settings_context(cwd)?;
             let launcher_root = settings_context
@@ -142,15 +156,89 @@ fn execute_with_services(
             let installed = install_version(
                 &launcher_root,
                 &settings_context.versions_folder,
-                &requested,
+                &install_request,
             )?;
-            writeln!(stdout, "Installed {}", installed.id).context("failed to write install output")
+            write_install_output(&installed, stdout)
+        }
+        Some("configure-path") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected argument for `configure-path`: `{extra}`");
+            }
+
+            let settings_context = load_settings_context(cwd)?;
+            let launcher_root = settings_context
+                .settings
+                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            let cli_name = settings_context.settings.cli_name();
+            let symlink_path =
+                configure_path(&launcher_root, cli_name, &current_exe()?, cwd, env_get)?;
+            writeln!(
+                stdout,
+                "Configured {cli_name} at {}",
+                symlink_path.display()
+            )
+            .context("failed to write configure-path output")
+        }
+        Some("unset-path") => {
+            if let Some(extra) = args.next() {
+                bail!("unexpected argument for `unset-path`: `{extra}`");
+            }
+
+            let settings_context = load_settings_context(cwd)?;
+            let launcher_root = settings_context
+                .settings
+                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            match unset_path(&launcher_root)? {
+                Some(path) => writeln!(stdout, "Unset {}", path.display()),
+                None => writeln!(stdout, "No path symlink configured"),
+            }
+            .context("failed to write unset-path output")
         }
         Some(command) => bail!(
             "unknown command `{command}`\n\n{}",
             usage_text(DEFAULT_CLI_NAME)
         ),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallRequest {
+    pub requested_version: String,
+    pub alias: Option<String>,
+}
+
+fn parse_install_request(
+    requested_version: String,
+    mut args: impl Iterator<Item = String>,
+) -> Result<InstallRequest> {
+    let mut alias = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--alias" {
+            let value = args
+                .next()
+                .context("missing value for `--alias` in `install`")?;
+            set_install_alias(&mut alias, value)?;
+        } else if let Some(value) = arg.strip_prefix("--alias=") {
+            set_install_alias(&mut alias, value.to_owned())?;
+        } else {
+            bail!("unexpected argument for `install`: `{arg}`");
+        }
+    }
+
+    Ok(InstallRequest {
+        requested_version,
+        alias,
+    })
+}
+
+fn set_install_alias(alias: &mut Option<String>, value: String) -> Result<()> {
+    if alias.is_some() {
+        bail!("`--alias` was provided more than once");
+    }
+    validate_path_segment(&value, "install alias")?;
+    *alias = Some(value);
+    Ok(())
 }
 
 pub fn load_settings(cwd: &Path) -> Result<Settings> {
@@ -198,6 +286,194 @@ pub fn ensure_launcher_root(launcher_root: &Path) -> Result<()> {
         .with_context(|| format!("failed to create `{}`", launcher_root.display()))
 }
 
+pub fn load_launcher_config(config_file: &Path) -> Result<LauncherConfig> {
+    if !config_file.is_file() {
+        return Ok(LauncherConfig::default());
+    }
+
+    let contents = fs::read_to_string(config_file)
+        .with_context(|| format!("failed to read `{}`", config_file.display()))?;
+    if contents.trim().is_empty() {
+        return Ok(LauncherConfig::default());
+    }
+
+    serde_yaml::from_str(&contents)
+        .with_context(|| format!("failed to parse `{}`", config_file.display()))
+}
+
+pub fn save_launcher_config(config_file: &Path, config: &LauncherConfig) -> Result<()> {
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+
+    let contents = serde_yaml::to_string(config).context("failed to serialize launcher config")?;
+    fs::write(config_file, contents)
+        .with_context(|| format!("failed to write `{}`", config_file.display()))
+}
+
+fn launcher_config_file(launcher_root: &Path) -> PathBuf {
+    launcher_root.join(CONFIG_FILE_NAME)
+}
+
+pub fn configure_path(
+    launcher_root: &Path,
+    cli_name: &str,
+    current_exe: &Path,
+    cwd: &Path,
+    env_get: &impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf> {
+    ensure_launcher_root(launcher_root)?;
+    validate_path_segment(cli_name, "CLI name")?;
+
+    let symlink_path = install_cli_symlink(cli_name, current_exe, cwd, env_get)?;
+    let config_file = launcher_config_file(launcher_root);
+    let mut config = load_launcher_config(&config_file)?;
+    config.path_symlink = Some(symlink_path.clone());
+    save_launcher_config(&config_file, &config)?;
+
+    Ok(symlink_path)
+}
+
+pub fn unset_path(launcher_root: &Path) -> Result<Option<PathBuf>> {
+    ensure_launcher_root(launcher_root)?;
+
+    let config_file = launcher_config_file(launcher_root);
+    let mut config = load_launcher_config(&config_file)?;
+    let Some(symlink_path) = config.path_symlink.take() else {
+        save_launcher_config(&config_file, &config)?;
+        return Ok(None);
+    };
+
+    match fs::symlink_metadata(&symlink_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&symlink_path)
+                .with_context(|| format!("failed to remove `{}`", symlink_path.display()))?;
+        }
+        Ok(_) => {
+            bail!(
+                "configured path `{}` is not a symlink; refusing to remove it",
+                symlink_path.display()
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect `{}`", symlink_path.display()));
+        }
+    }
+
+    save_launcher_config(&config_file, &config)?;
+    Ok(Some(symlink_path))
+}
+
+fn install_cli_symlink(
+    cli_name: &str,
+    current_exe: &Path,
+    cwd: &Path,
+    env_get: &impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf> {
+    let path_var = env_get("PATH").context("PATH is not set, cannot configure CLI path")?;
+    let mut failures = Vec::new();
+
+    for path_dir in std::env::split_paths(&path_var) {
+        let path_dir = absolute_path_from_entry(&path_dir, cwd);
+        if !path_dir.is_dir() {
+            continue;
+        }
+
+        let symlink_path = path_dir.join(cli_name);
+        match fs::symlink_metadata(&symlink_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let linked_to = fs::read_link(&symlink_path)
+                    .with_context(|| format!("failed to read `{}`", symlink_path.display()))?;
+                let linked_to = absolute_link_target(&symlink_path, &linked_to);
+                if same_files(&linked_to, current_exe) {
+                    return Ok(symlink_path);
+                }
+
+                failures.push(format!(
+                    "`{}` already links to `{}`",
+                    symlink_path.display(),
+                    linked_to.display()
+                ));
+                continue;
+            }
+            Ok(_) => {
+                failures.push(format!(
+                    "`{}` already exists and is not a symlink",
+                    symlink_path.display()
+                ));
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failures.push(format!(
+                    "failed to inspect `{}`: {error}",
+                    symlink_path.display()
+                ));
+                continue;
+            }
+        }
+
+        match create_cli_symlink(current_exe, &symlink_path) {
+            Ok(()) => return Ok(symlink_path),
+            Err(error) => failures.push(format!(
+                "failed to create `{}`: {error}",
+                symlink_path.display()
+            )),
+        }
+    }
+
+    if failures.is_empty() {
+        bail!("could not find an existing PATH directory for `{cli_name}`");
+    }
+
+    bail!(
+        "could not create `{cli_name}` in any PATH directory: {}",
+        failures.join("; ")
+    )
+}
+
+fn absolute_path_from_entry(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn absolute_link_target(link_path: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        link_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(target)
+    }
+}
+
+fn same_files(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+#[cfg(unix)]
+fn create_cli_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_cli_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+fn current_exe_path() -> Result<PathBuf> {
+    std::env::current_exe().context("failed to determine current executable path")
+}
+
 pub fn fetch_fabric_loader_versions() -> Result<Vec<String>> {
     let user_agent = format!("{DEFAULT_CLI_NAME}/{}", env!("CARGO_PKG_VERSION"));
     let agent = ureq::AgentBuilder::new()
@@ -235,6 +511,7 @@ struct FabricLoaderVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledVersion {
     pub id: String,
+    pub alias: Option<String>,
 }
 
 pub fn install_minecraft_version(
@@ -242,11 +519,21 @@ pub fn install_minecraft_version(
     versions_folder: &Path,
     requested_version: &str,
 ) -> Result<InstalledVersion> {
+    install_minecraft_version_with_alias(launcher_root, versions_folder, requested_version, None)
+}
+
+pub fn install_minecraft_version_with_alias(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    requested_version: &str,
+    alias: Option<&str>,
+) -> Result<InstalledVersion> {
     let mut downloader = HttpDownloader::new();
     install_minecraft_version_with_downloader(
         launcher_root,
         versions_folder,
         requested_version,
+        alias,
         &mut downloader,
     )
 }
@@ -255,6 +542,7 @@ fn install_minecraft_version_with_downloader(
     launcher_root: &Path,
     versions_folder: &Path,
     requested_version: &str,
+    alias: Option<&str>,
     downloader: &mut impl Downloader,
 ) -> Result<InstalledVersion> {
     let manifest = downloader.download_string(MINECRAFT_VERSION_MANIFEST_URL)?;
@@ -262,15 +550,18 @@ fn install_minecraft_version_with_downloader(
     let selected = resolve_minecraft_version(&manifest, requested_version)?;
     let version_id = selected.id.clone();
     let version_url = selected.url.clone();
+    validate_path_segment(&version_id, "resolved version id")?;
+    let install_name = alias.unwrap_or(&version_id);
+    validate_path_segment(install_name, "install alias")?;
 
     let version_data_json = downloader.download_string(&version_url)?;
     let version_data = parse_minecraft_version_data(&version_data_json)?;
 
-    let version_dir = versions_folder.join(&version_id);
+    let version_dir = versions_folder.join(install_name);
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("failed to create `{}`", version_dir.display()))?;
     fs::write(
-        version_dir.join(format!("{version_id}.json")),
+        version_dir.join(format!("{install_name}.json")),
         &version_data_json,
     )
     .with_context(|| format!("failed to write version data for `{version_id}`"))?;
@@ -279,7 +570,10 @@ fn install_minecraft_version_with_downloader(
         .downloads
         .client
         .context("selected Minecraft version does not include a client download")?;
-    downloader.download_to_path(&client.url, &version_dir.join(format!("{version_id}.jar")))?;
+    downloader.download_to_path(
+        &client.url,
+        &version_dir.join(format!("{install_name}.jar")),
+    )?;
 
     if let Some(asset_index) = version_data.asset_index {
         install_assets(launcher_root, &asset_index, downloader)?;
@@ -287,7 +581,10 @@ fn install_minecraft_version_with_downloader(
 
     install_libraries(launcher_root, version_data.libraries, downloader)?;
 
-    Ok(InstalledVersion { id: version_id })
+    Ok(InstalledVersion {
+        id: version_id,
+        alias: alias.map(str::to_owned),
+    })
 }
 
 fn install_assets(
@@ -553,6 +850,24 @@ pub fn expand_path(raw_path: &str, env_get: &impl Fn(&str) -> Option<String>) ->
     Ok(PathBuf::from(expanded))
 }
 
+fn validate_path_segment(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    if value.trim() != value {
+        bail!("{label} cannot contain leading or trailing whitespace");
+    }
+    if value.contains('/') || value.contains('\\') {
+        bail!("{label} must be a single path segment");
+    }
+
+    let mut components = Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => bail!("{label} must be a single path segment"),
+    }
+}
+
 fn write_versions(versions: &[String], stdout: &mut impl Write) -> Result<()> {
     for version in versions {
         writeln!(stdout, "{version}").context("failed to write version output")?;
@@ -560,12 +875,22 @@ fn write_versions(versions: &[String], stdout: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+fn write_install_output(installed: &InstalledVersion, stdout: &mut impl Write) -> Result<()> {
+    match installed.alias.as_deref() {
+        Some(alias) => writeln!(stdout, "Installed {} as {alias}", installed.id),
+        None => writeln!(stdout, "Installed {}", installed.id),
+    }
+    .context("failed to write install output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
-    format!("Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest\n")
+    format!(
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias <name>]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+    )
 }
 
 #[cfg(test)]
@@ -659,6 +984,7 @@ cli_name: custom-launcher
             &mut stdout,
             || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
             |_, _, _| unreachable!("versions command should not install versions"),
+            || unreachable!("versions command should not inspect the current executable"),
         )
         .unwrap();
 
@@ -749,16 +1075,156 @@ cli_name: custom-launcher
             |root, versions, requested| {
                 assert_eq!(root, launcher_root.as_path());
                 assert_eq!(versions, versions_folder.as_path());
-                assert_eq!(requested, "1.18");
+                assert_eq!(
+                    requested,
+                    &InstallRequest {
+                        requested_version: "1.18".to_owned(),
+                        alias: None,
+                    }
+                );
                 assert!(root.is_dir());
                 Ok(InstalledVersion {
                     id: "1.18.2".to_owned(),
+                    alias: None,
                 })
             },
+            || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "Installed 1.18.2\n");
+    }
+
+    #[test]
+    fn install_command_accepts_alias() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = repo.path().join("build").join("versions");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            repo.path().join(SETTINGS_FILE),
+            format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
+        )
+        .unwrap();
+
+        let mut stdout = Vec::new();
+        execute_with_services(
+            vec![
+                "install".to_owned(),
+                "latest".to_owned(),
+                "--alias".to_owned(),
+                "survival".to_owned(),
+            ],
+            &cwd,
+            &test_env,
+            &mut stdout,
+            || unreachable!("install command should not fetch Fabric versions"),
+            |root, versions, requested| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(versions, versions_folder.as_path());
+                assert_eq!(
+                    requested,
+                    &InstallRequest {
+                        requested_version: "latest".to_owned(),
+                        alias: Some("survival".to_owned()),
+                    }
+                );
+                Ok(InstalledVersion {
+                    id: "1.20.4".to_owned(),
+                    alias: requested.alias.clone(),
+                })
+            },
+            || unreachable!("install command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "Installed 1.20.4 as survival\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configure_and_unset_path_manage_symlink_config() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let launcher_root = repo.path().join("launcher");
+        let bin_dir = repo.path().join("bin");
+        let exe_path = repo
+            .path()
+            .join("target")
+            .join("debug")
+            .join("clear-launcher");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
+        fs::write(&exe_path, "binary").unwrap();
+        fs::write(
+            repo.path().join(SETTINGS_FILE),
+            format!(
+                "launcher_path:\n  linux: \"{}\"\ncli_name: custom-launcher\n",
+                launcher_root.display()
+            ),
+        )
+        .unwrap();
+
+        let env = |key: &str| match key {
+            "HOME" => Some("/home/player".to_owned()),
+            "APPDATA" => Some("C:/Users/Player/AppData/Roaming".to_owned()),
+            "PATH" => Some(bin_dir.display().to_string()),
+            _ => None,
+        };
+
+        let mut stdout = Vec::new();
+        execute_with_services(
+            vec!["configure-path".to_owned()],
+            &cwd,
+            &env,
+            &mut stdout,
+            || unreachable!("configure-path should not fetch Fabric versions"),
+            |_, _, _| unreachable!("configure-path should not install versions"),
+            || Ok(exe_path.clone()),
+        )
+        .unwrap();
+
+        let symlink_path = bin_dir.join("custom-launcher");
+        assert_eq!(fs::read_link(&symlink_path).unwrap(), exe_path);
+        assert_eq!(
+            load_launcher_config(&launcher_root.join(CONFIG_FILE_NAME))
+                .unwrap()
+                .path_symlink,
+            Some(symlink_path.clone())
+        );
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Configured custom-launcher at {}\n", symlink_path.display())
+        );
+
+        let mut stdout = Vec::new();
+        execute_with_services(
+            vec!["unset-path".to_owned()],
+            &cwd,
+            &env,
+            &mut stdout,
+            || unreachable!("unset-path should not fetch Fabric versions"),
+            |_, _, _| unreachable!("unset-path should not install versions"),
+            || unreachable!("unset-path should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert!(!symlink_path.exists());
+        assert_eq!(
+            load_launcher_config(&launcher_root.join(CONFIG_FILE_NAME))
+                .unwrap()
+                .path_symlink,
+            None
+        );
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Unset {}\n", symlink_path.display())
+        );
     }
 
     #[test]
@@ -829,6 +1295,7 @@ cli_name: custom-launcher
             &launcher_root,
             &versions_folder,
             "latest",
+            None,
             &mut downloader,
         )
         .unwrap();
@@ -859,6 +1326,70 @@ cli_name: custom-launcher
             fs::read(launcher_root.join("libraries/org/example/lib/1.0/lib-1.0.jar")).unwrap(),
             b"https://example.test/lib-1.0.jar"
         );
+    }
+
+    #[test]
+    fn installs_minecraft_version_files_under_alias() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = repo.path().join("build").join("versions");
+        let version_data = r#"
+{
+  "downloads": {
+    "client": {
+      "url": "https://example.test/client.jar"
+    }
+  }
+}
+"#;
+
+        let mut downloader = FakeDownloader::new([
+            (
+                MINECRAFT_VERSION_MANIFEST_URL,
+                r#"
+{
+  "latest": {
+    "release": "1.20.4",
+    "snapshot": "23w13a_or_b"
+  },
+  "versions": [
+    {
+      "id": "1.20.4",
+      "type": "release",
+      "url": "https://example.test/1.20.4.json"
+    }
+  ]
+}
+"#,
+            ),
+            ("https://example.test/1.20.4.json", version_data),
+        ]);
+
+        let installed = install_minecraft_version_with_downloader(
+            &launcher_root,
+            &versions_folder,
+            "latest",
+            Some("survival"),
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed,
+            InstalledVersion {
+                id: "1.20.4".to_owned(),
+                alias: Some("survival".to_owned()),
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(versions_folder.join("survival/survival.json")).unwrap(),
+            version_data
+        );
+        assert_eq!(
+            fs::read(versions_folder.join("survival/survival.jar")).unwrap(),
+            b"https://example.test/client.jar"
+        );
+        assert!(!versions_folder.join("1.20.4").exists());
     }
 
     struct FakeDownloader {
