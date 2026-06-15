@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -822,13 +823,105 @@ impl Downloader for HttpDownloader {
             .get(url)
             .call()
             .with_context(|| format!("failed to download `{url}`"))?;
-        let mut reader = response.into_reader();
-        let mut file = fs::File::create(path)
-            .with_context(|| format!("failed to create `{}`", path.display()))?;
-        io::copy(&mut reader, &mut file)
-            .with_context(|| format!("failed to write `{}`", path.display()))?;
-        Ok(())
+        let content_length = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok());
+        let progress = download_progress_bar(path, content_length);
+        let partial_path = partial_download_path(path);
+        match fs::remove_file(&partial_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                progress.finish_and_clear();
+                return Err(error)
+                    .with_context(|| format!("failed to remove `{}`", partial_path.display()));
+            }
+        }
+
+        let mut reader = progress.wrap_read(response.into_reader());
+        let result = (|| -> Result<()> {
+            let mut file = fs::File::create(&partial_path)
+                .with_context(|| format!("failed to create `{}`", partial_path.display()))?;
+            io::copy(&mut reader, &mut file)
+                .with_context(|| format!("failed to write `{}`", partial_path.display()))?;
+            file.flush()
+                .with_context(|| format!("failed to flush `{}`", partial_path.display()))?;
+            fs::rename(&partial_path, path).with_context(|| {
+                format!(
+                    "failed to move `{}` to `{}`",
+                    partial_path.display(),
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })();
+        progress.finish_and_clear();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&partial_path);
+        }
+
+        result
     }
+}
+
+fn download_progress_bar(path: &Path, content_length: Option<u64>) -> ProgressBar {
+    let label = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let label = truncate_progress_label(label);
+
+    match content_length {
+        Some(total) => {
+            let progress = ProgressBar::new(total);
+            progress.set_style(progress_bar_style());
+            progress.set_message(label);
+            progress
+        }
+        None => {
+            let progress = ProgressBar::new_spinner();
+            progress.set_style(download_spinner_style());
+            progress.enable_steady_tick(Duration::from_millis(100));
+            progress.set_message(label);
+            progress
+        }
+    }
+}
+
+fn truncate_progress_label(label: &str) -> String {
+    const MAX_LABEL_WIDTH: usize = 32;
+
+    if label.chars().count() <= MAX_LABEL_WIDTH {
+        return label.to_owned();
+    }
+
+    format!(
+        "{}...",
+        label.chars().take(MAX_LABEL_WIDTH - 3).collect::<String>()
+    )
+}
+
+fn partial_download_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "download".into());
+    file_name.push(".part");
+    path.with_file_name(file_name)
+}
+
+fn progress_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{msg:32} [{bar:40}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12} ETA {eta}",
+    )
+    .expect("valid progress bar template")
+    .progress_chars("=>-")
+}
+
+fn download_spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {msg:32} {bytes:>10} {bytes_per_sec:>12}")
+        .expect("valid progress spinner template")
 }
 
 #[derive(Debug, Deserialize)]
