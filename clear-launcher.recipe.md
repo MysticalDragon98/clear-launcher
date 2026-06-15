@@ -7,7 +7,7 @@ Clear code minecraft launcher
 **Compilation Settings File:** `settings.yml` file located on this repository
 **Build Folder:** Folder where the output source code will be located
 **CLI Name:** Nombre con el cual será instalada la CLI
-**Versions Folder:**  {Build Folder}/versions - Folder where minecraft versions are installed
+**Versions Folder:**  {Launcher Path}/versions - Folder where minecraft versions are installed
 **Config File:** {Launcher Path}/config.yml file that stores the local configuration
 
 ## 1. Compilation Settings
@@ -51,7 +51,7 @@ List all existing Fabric versions
 
 ### 2. [Command] Installing Versions
 
-**Usage:** `{CLI Name} install {version}|latest `[--alias ]
+**Usage:** `{CLI Name} install {version}|latest `[--alias {alias}]
 
 Installs an specific minecraft version, that version can be one of the following:
 
@@ -59,7 +59,10 @@ Installs an specific minecraft version, that version can be one of the following
 - **Major Version:** ex. 1.18, in that case, it takes the last one
 - **Latest:** "latest" - Uses the latest version
 
-The install will download the specified version at the **Versions Folder** under the {Versions Folder}/{version}
+The install will download the specified version at the **Versions Folder** under the {Versions Folder}/{version}/{alias | default}
+If such version is already installed, abort.
+
+Alias provide ways to have different setups for the same version
 
 ## 3. [Command] Path commands
 

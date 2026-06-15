@@ -11,6 +11,7 @@ pub const SETTINGS_FILE: &str = "settings.yml";
 pub const CONFIG_FILE_NAME: &str = "config.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
+pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
@@ -153,11 +154,8 @@ fn execute_with_services(
                 .settings
                 .launcher_path_for(OperatingSystem::current()?, env_get)?;
             ensure_launcher_root(&launcher_root)?;
-            let installed = install_version(
-                &launcher_root,
-                &settings_context.versions_folder,
-                &install_request,
-            )?;
+            let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            let installed = install_version(&launcher_root, &versions_folder, &install_request)?;
             write_install_output(&installed, stdout)
         }
         Some("configure-path") => {
@@ -247,7 +245,6 @@ pub fn load_settings(cwd: &Path) -> Result<Settings> {
 
 struct SettingsContext {
     settings: Settings,
-    versions_folder: PathBuf,
 }
 
 fn load_settings_context(cwd: &Path) -> Result<SettingsContext> {
@@ -261,17 +258,8 @@ fn load_settings_context(cwd: &Path) -> Result<SettingsContext> {
         .with_context(|| format!("failed to read `{}`", path.display()))?;
     let settings = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse `{}`", path.display()))?;
-    let versions_folder = versions_folder_for_settings_path(&path);
 
-    Ok(SettingsContext {
-        settings,
-        versions_folder,
-    })
-}
-
-fn versions_folder_for_settings_path(settings_path: &Path) -> PathBuf {
-    let repo_root = settings_path.parent().unwrap_or_else(|| Path::new(""));
-    repo_root.join(BUILD_FOLDER_NAME).join(VERSIONS_FOLDER_NAME)
+    Ok(SettingsContext { settings })
 }
 
 pub fn find_settings_path(start: &Path) -> Option<PathBuf> {
@@ -551,13 +539,23 @@ fn install_minecraft_version_with_downloader(
     let version_id = selected.id.clone();
     let version_url = selected.url.clone();
     validate_path_segment(&version_id, "resolved version id")?;
-    let install_name = alias.unwrap_or(&version_id);
+    let install_name = alias.unwrap_or(DEFAULT_INSTALL_ALIAS);
     validate_path_segment(install_name, "install alias")?;
+
+    let version_dir = versions_folder.join(&version_id).join(install_name);
+    if version_dir
+        .try_exists()
+        .with_context(|| format!("failed to inspect `{}`", version_dir.display()))?
+    {
+        bail!(
+            "Minecraft version `{version_id}` with alias `{install_name}` is already installed at `{}`",
+            version_dir.display()
+        );
+    }
 
     let version_data_json = downloader.download_string(&version_url)?;
     let version_data = parse_minecraft_version_data(&version_data_json)?;
 
-    let version_dir = versions_folder.join(install_name);
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("failed to create `{}`", version_dir.display()))?;
     fs::write(
@@ -889,7 +887,7 @@ fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias <name>]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -1057,7 +1055,7 @@ cli_name: custom-launcher
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
         let launcher_root = repo.path().join("launcher");
-        let versions_folder = repo.path().join("build").join("versions");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         fs::create_dir_all(&cwd).unwrap();
         fs::write(
             repo.path().join(SETTINGS_FILE),
@@ -1100,7 +1098,7 @@ cli_name: custom-launcher
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
         let launcher_root = repo.path().join("launcher");
-        let versions_folder = repo.path().join("build").join("versions");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         fs::create_dir_all(&cwd).unwrap();
         fs::write(
             repo.path().join(SETTINGS_FILE),
@@ -1231,7 +1229,7 @@ cli_name: custom-launcher
     fn installs_minecraft_version_files_from_manifest() {
         let repo = tempfile::tempdir().unwrap();
         let launcher_root = repo.path().join("launcher");
-        let versions_folder = repo.path().join("build").join("versions");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         let asset_hash = "abcdef0123456789abcdef0123456789abcdef01";
         let version_data = r#"
 {
@@ -1302,14 +1300,14 @@ cli_name: custom-launcher
 
         assert_eq!(installed.id, "1.18.2");
         assert_eq!(
-            fs::read_to_string(versions_folder.join("1.18.2/1.18.2.json")).unwrap(),
+            fs::read_to_string(versions_folder.join("1.18.2/default/default.json")).unwrap(),
             version_data
         );
         assert_eq!(
-            fs::read(versions_folder.join("1.18.2/1.18.2.jar")).unwrap(),
+            fs::read(versions_folder.join("1.18.2/default/default.jar")).unwrap(),
             b"https://example.test/client.jar"
         );
-        assert!(!launcher_root.join("versions/1.18.2").exists());
+        assert!(launcher_root.join("versions/1.18.2/default").exists());
         assert!(launcher_root.join("assets/indexes/1.18.json").is_file());
         assert_eq!(
             fs::read(
@@ -1332,7 +1330,7 @@ cli_name: custom-launcher
     fn installs_minecraft_version_files_under_alias() {
         let repo = tempfile::tempdir().unwrap();
         let launcher_root = repo.path().join("launcher");
-        let versions_folder = repo.path().join("build").join("versions");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         let version_data = r#"
 {
   "downloads": {
@@ -1382,14 +1380,52 @@ cli_name: custom-launcher
             }
         );
         assert_eq!(
-            fs::read_to_string(versions_folder.join("survival/survival.json")).unwrap(),
+            fs::read_to_string(versions_folder.join("1.20.4/survival/survival.json")).unwrap(),
             version_data
         );
         assert_eq!(
-            fs::read(versions_folder.join("survival/survival.jar")).unwrap(),
+            fs::read(versions_folder.join("1.20.4/survival/survival.jar")).unwrap(),
             b"https://example.test/client.jar"
         );
-        assert!(!versions_folder.join("1.20.4").exists());
+        assert!(!versions_folder.join("1.20.4/default").exists());
+    }
+
+    #[test]
+    fn install_aborts_when_alias_target_already_exists() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        fs::create_dir_all(versions_folder.join("1.20.4/survival")).unwrap();
+
+        let mut downloader = FakeDownloader::new([(
+            MINECRAFT_VERSION_MANIFEST_URL,
+            r#"
+{
+  "latest": {
+    "release": "1.20.4",
+    "snapshot": "23w13a_or_b"
+  },
+  "versions": [
+    {
+      "id": "1.20.4",
+      "type": "release",
+      "url": "https://example.test/1.20.4.json"
+    }
+  ]
+}
+"#,
+        )]);
+
+        let error = install_minecraft_version_with_downloader(
+            &launcher_root,
+            &versions_folder,
+            "latest",
+            Some("survival"),
+            &mut downloader,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already installed"));
     }
 
     struct FakeDownloader {
