@@ -25,18 +25,23 @@ struct LauncherPaths {
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let settings_path = manifest_dir
+    let source_folder = manifest_dir
         .parent()
         .expect("build crate must live under the recipe repository")
-        .join("settings.yml");
+        .to_path_buf();
+    let settings_path = source_folder.join("settings.yml");
+    let mod_scaffolding_path = source_folder.join("scaffolding").join("mods");
 
     println!("cargo:rerun-if-changed={}", settings_path.display());
+    println!("cargo:rerun-if-changed={}", mod_scaffolding_path.display());
 
     let contents = fs::read_to_string(&settings_path)
         .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", settings_path.display()));
     let settings: Settings = serde_yaml::from_str(&contents)
         .unwrap_or_else(|error| panic!("failed to parse `{}`: {error}", settings_path.display()));
+    let source_folder = source_folder.to_string_lossy().into_owned();
 
+    emit_compile_value("CLEAR_LAUNCHER_SOURCE_FOLDER", &source_folder);
     emit_compile_value(
         "CLEAR_LAUNCHER_CLI_NAME",
         configured_value(settings.cli_name.as_deref(), DEFAULT_CLI_NAME),

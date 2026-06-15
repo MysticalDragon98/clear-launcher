@@ -12,6 +12,7 @@ Clear code minecraft launcher
 **Version Folder:** Do not confuse with **Versions Folder**, the **Version Folder** is an specific installed version of minecraft at `{Versions Folder}/{version}/{alias}`
 **My Mods Folder:** Folder where downloaded and created mods lives, this is located on the **Config File**'s mods_folder property and defaults to `{Launcher Path}/mods`
 **Version Mod Folder:** Folder located at `{Version Folder}/mods`, it stored installed mod for an specific version alias
+**Source Folder:** Current folder where this file is located, it is the actual location of the source code, non dependent on pwd
 
 ## 1. Compilation Settings & Configuration File
 
@@ -111,7 +112,7 @@ The mod **must** follow this default configuration
 - **Loom Version:** Dependent of the Fabric Version
 - **Gradle Version:** Defaults to latest LTS
 
-
+After creating the mod, copy the  `{Source Folder}/scaffolding/mods` into the newly created folder
 
 ### 6. [Command] Building Mods
 

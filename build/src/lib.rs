@@ -17,6 +17,7 @@ pub const DEFAULT_CLI_NAME: &str = env!("CLEAR_LAUNCHER_CLI_NAME");
 pub const DEFAULT_LINUX_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_LINUX");
 pub const DEFAULT_MACOS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_MACOS");
 pub const DEFAULT_WINDOWS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_WINDOWS");
+pub const SOURCE_FOLDER: &str = env!("CLEAR_LAUNCHER_SOURCE_FOLDER");
 pub const CONFIG_FILE_NAME: &str = "config.yml";
 pub const MOD_CONFIG_FILE_NAME: &str = "mod.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
@@ -1374,6 +1375,7 @@ fn create_mod_project_with_services(
     fs::create_dir_all(&mod_dir)
         .with_context(|| format!("failed to create `{}`", mod_dir.display()))?;
     write_mod_project_files(&mod_dir, &project_config)?;
+    copy_mod_scaffolding(&mod_dir)?;
     commands.git_init(&mod_dir)?;
     let editor_opened = commands.open_editor(config.editor_command(), &mod_dir)?;
 
@@ -1477,6 +1479,86 @@ fn write_mod_project_files(project_dir: &Path, config: &ModProjectConfig) -> Res
             .join(format!("{source_path}.java")),
         &java_entrypoint_contents(config),
     )
+}
+
+fn copy_mod_scaffolding(project_dir: &Path) -> Result<()> {
+    let scaffolding_dir = Path::new(SOURCE_FOLDER)
+        .join("scaffolding")
+        .join(MODS_FOLDER_NAME);
+    copy_directory_contents(&scaffolding_dir, project_dir).with_context(|| {
+        format!(
+            "failed to copy mod scaffolding from `{}` into `{}`",
+            scaffolding_dir.display(),
+            project_dir.display()
+        )
+    })
+}
+
+fn copy_directory_contents(source_dir: &Path, destination_dir: &Path) -> Result<()> {
+    let metadata = fs::metadata(source_dir)
+        .with_context(|| format!("failed to inspect `{}`", source_dir.display()))?;
+    if !metadata.is_dir() {
+        bail!("`{}` is not a directory", source_dir.display());
+    }
+
+    fs::create_dir_all(destination_dir)
+        .with_context(|| format!("failed to create `{}`", destination_dir.display()))?;
+    for entry in fs::read_dir(source_dir)
+        .with_context(|| format!("failed to read `{}`", source_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", source_dir.display()))?;
+        let source = entry.path();
+        let destination = destination_dir.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect `{}`", source.display()))?;
+
+        if file_type.is_dir() {
+            copy_directory_contents(&source, &destination)?;
+        } else if file_type.is_file() {
+            copy_file(&source, &destination)?;
+        } else if file_type.is_symlink() {
+            copy_symlink_target(&source, &destination)?;
+        } else {
+            bail!(
+                "unsupported scaffolding file type at `{}`",
+                source.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_symlink_target(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::metadata(source)
+        .with_context(|| format!("failed to inspect `{}`", source.display()))?;
+    if metadata.is_dir() {
+        copy_directory_contents(source, destination)
+    } else if metadata.is_file() {
+        copy_file(source, destination)
+    } else {
+        bail!(
+            "unsupported scaffolding symlink target at `{}`",
+            source.display()
+        );
+    }
+}
+
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+
+    fs::copy(source, destination).map(|_| ()).with_context(|| {
+        format!(
+            "failed to copy `{}` to `{}`",
+            source.display(),
+            destination.display()
+        )
+    })
 }
 
 fn write_project_file(path: &Path, contents: &str) -> Result<()> {
@@ -4280,6 +4362,14 @@ mod tests {
         assert!(project_dir.join("build.gradle").is_file());
         assert!(project_dir.join("gradle.properties").is_file());
         assert!(project_dir.join("mod.yml").is_file());
+        assert!(project_dir.join("MOD.md").is_file());
+        let compile_skill = project_dir.join(".codex/skills/compile/SKILL.md");
+        assert!(compile_skill.is_file());
+        assert!(
+            fs::read_to_string(compile_skill)
+                .unwrap()
+                .contains("mc-mods build")
+        );
         assert!(
             project_dir
                 .join("src/main/java/com/clearlauncher/cool_blocks/CoolBlocks.java")
