@@ -3,9 +3,12 @@ use serde::Deserialize;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = "clear-launcher";
 pub const SETTINGS_FILE: &str = "settings.yml";
+pub const VERSION_MANIFEST_URL: &str =
+    "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -82,6 +85,16 @@ pub fn execute(
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
 ) -> Result<()> {
+    execute_with_version_fetcher(args, cwd, env_get, stdout, fetch_minecraft_versions)
+}
+
+fn execute_with_version_fetcher(
+    args: impl IntoIterator<Item = String>,
+    cwd: &Path,
+    env_get: &impl Fn(&str) -> Option<String>,
+    stdout: &mut impl Write,
+    fetch_versions: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<()> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
         None | Some("-h") | Some("--help") => write_usage(DEFAULT_CLI_NAME, stdout),
@@ -92,7 +105,8 @@ pub fn execute(
 
             let settings = load_settings(cwd)?;
             let launcher_root = settings.launcher_path_for(OperatingSystem::current()?, env_get)?;
-            let versions = list_versions(&launcher_root)?;
+            ensure_launcher_root(&launcher_root)?;
+            let versions = fetch_versions()?;
             write_versions(&versions, stdout)
         }
         Some(command) => bail!("unknown command `{command}`\n\nUsage: {DEFAULT_CLI_NAME} versions"),
@@ -118,35 +132,51 @@ pub fn find_settings_path(start: &Path) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-pub fn list_versions(launcher_root: &Path) -> Result<Vec<String>> {
-    let versions_dir = launcher_root.join("versions");
-    let entries = match fs::read_dir(&versions_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read `{}`", versions_dir.display()));
-        }
-    };
+pub fn ensure_launcher_root(launcher_root: &Path) -> Result<()> {
+    fs::create_dir_all(launcher_root)
+        .with_context(|| format!("failed to create `{}`", launcher_root.display()))
+}
 
-    let mut versions = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .with_context(|| format!("failed to read an entry in `{}`", versions_dir.display()))?;
-        let file_type = entry.file_type().with_context(|| {
-            format!(
-                "failed to inspect version entry `{}`",
-                entry.path().display()
-            )
-        })?;
+pub fn fetch_minecraft_versions() -> Result<Vec<String>> {
+    let user_agent = format!("{DEFAULT_CLI_NAME}/{}", env!("CARGO_PKG_VERSION"));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .user_agent(&user_agent)
+        .build();
 
-        if file_type.is_dir() {
-            versions.push(entry.file_name().to_string_lossy().into_owned());
-        }
+    let response = agent.get(VERSION_MANIFEST_URL).call().with_context(|| {
+        format!("failed to request Minecraft version manifest from `{VERSION_MANIFEST_URL}`")
+    })?;
+
+    let manifest = response
+        .into_string()
+        .context("failed to read Minecraft version manifest response")?;
+    parse_minecraft_versions_manifest(&manifest)
+}
+
+pub fn parse_minecraft_versions_manifest(manifest: &str) -> Result<Vec<String>> {
+    let manifest: VersionManifest =
+        serde_json::from_str(manifest).context("failed to parse Minecraft version manifest")?;
+    Ok(manifest.into_version_ids())
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionManifest {
+    versions: Vec<ManifestVersion>,
+}
+
+impl VersionManifest {
+    fn into_version_ids(self) -> Vec<String> {
+        self.versions
+            .into_iter()
+            .map(|version| version.id)
+            .collect()
     }
+}
 
-    versions.sort_unstable();
-    Ok(versions)
+#[derive(Debug, Deserialize)]
+struct ManifestVersion {
+    id: String,
 }
 
 pub fn expand_path(raw_path: &str, env_get: &impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
@@ -224,35 +254,44 @@ cli_name: custom-launcher
     }
 
     #[test]
-    fn list_versions_returns_sorted_version_directories() {
-        let temp = tempfile::tempdir().unwrap();
-        let versions_dir = temp.path().join("versions");
-        fs::create_dir_all(versions_dir.join("1.20.4")).unwrap();
-        fs::create_dir_all(versions_dir.join("1.19.4")).unwrap();
-        fs::write(versions_dir.join("README.txt"), "not a version").unwrap();
+    fn parses_minecraft_versions_manifest_in_api_order() {
+        let versions = parse_minecraft_versions_manifest(
+            r#"
+{
+  "latest": {
+    "release": "1.20.4",
+    "snapshot": "23w13a_or_b"
+  },
+  "versions": [
+    {
+      "id": "1.20.4",
+      "type": "release",
+      "url": "https://example.test/1.20.4.json",
+      "time": "2024-01-01T00:00:00+00:00",
+      "releaseTime": "2024-01-01T00:00:00+00:00"
+    },
+    {
+      "id": "23w13a_or_b",
+      "type": "snapshot",
+      "url": "https://example.test/23w13a_or_b.json",
+      "time": "2023-04-01T00:00:00+00:00",
+      "releaseTime": "2023-04-01T00:00:00+00:00"
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
 
-        let versions = list_versions(temp.path()).unwrap();
-
-        assert_eq!(versions, vec!["1.19.4", "1.20.4"]);
+        assert_eq!(versions, vec!["1.20.4", "23w13a_or_b"]);
     }
 
     #[test]
-    fn missing_versions_directory_is_empty() {
-        let temp = tempfile::tempdir().unwrap();
-
-        let versions = list_versions(temp.path()).unwrap();
-
-        assert!(versions.is_empty());
-    }
-
-    #[test]
-    fn versions_command_reads_settings_from_parent_directory() {
+    fn versions_command_reads_settings_and_fetches_from_api() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
         let launcher_root = repo.path().join("launcher");
         fs::create_dir_all(&cwd).unwrap();
-        fs::create_dir_all(launcher_root.join("versions").join("1.20.1")).unwrap();
-        fs::create_dir_all(launcher_root.join("versions").join("23w13a_or_b")).unwrap();
         fs::write(
             repo.path().join(SETTINGS_FILE),
             format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
@@ -260,8 +299,16 @@ cli_name: custom-launcher
         .unwrap();
 
         let mut stdout = Vec::new();
-        execute(vec!["versions".to_owned()], &cwd, &test_env, &mut stdout).unwrap();
+        execute_with_version_fetcher(
+            vec!["versions".to_owned()],
+            &cwd,
+            &test_env,
+            &mut stdout,
+            || Ok(vec!["1.20.1".to_owned(), "23w13a_or_b".to_owned()]),
+        )
+        .unwrap();
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "1.20.1\n23w13a_or_b\n");
+        assert!(launcher_root.is_dir());
     }
 }
