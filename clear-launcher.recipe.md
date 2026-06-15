@@ -8,6 +8,7 @@ Clear code minecraft launcher
 **Build Folder:** Folder where the output source code will be located
 **CLI Name:** Nombre con el cual será instalada la CLI
 **Versions Folder:**  {Build Folder}/versions - Folder where minecraft versions are installed
+**Config File:** {Launcher Path}/config.yml file that stores the local configuration
 
 ## 1. Compilation Settings
 
@@ -50,7 +51,7 @@ List all existing Fabric versions
 
 ### 2. [Command] Installing Versions
 
-**Usage:** `{CLI Name} install {version}|latest`
+**Usage:** `{CLI Name} install {version}|latest `[--alias ]
 
 Installs an specific minecraft version, that version can be one of the following:
 
@@ -59,3 +60,13 @@ Installs an specific minecraft version, that version can be one of the following
 - **Latest:** "latest" - Uses the latest version
 
 The install will download the specified version at the **Versions Folder** under the {Versions Folder}/{version}
+
+## 3. [Command] Path commands
+
+**Usage:** 
+
+- `{CLI Name} configure-path`: Installs the CLI into the user's PATH and stores the created symlink path into the **Config File**
+- `{CLI Name} unset-path` : Uninstalls the CLI from the user's PATH and clears the created symlink from the **Config File**
+
+
+
