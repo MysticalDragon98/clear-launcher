@@ -7,6 +7,7 @@ Clear code minecraft launcher
 **Compilation Settings File:** `settings.yml` file located on this repository
 **Build Folder:** Folder where the output source code will be located
 **CLI Name:** Nombre con el cual será instalada la CLI
+**Versions Folder:**  {Build Folder}/versions - Folder where minecraft versions are installed
 
 ## 1. Compilation Settings
 
@@ -56,3 +57,5 @@ Installs an specific minecraft version, that version can be one of the following
 - **Specific version**
 - **Major Version:** ex. 1.18, in that case, it takes the last one
 - **Latest:** "latest" - Uses the latest version
+
+The install will download the specified version at the **Versions Folder** under the {Versions Folder}/{version}

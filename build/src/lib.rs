@@ -8,6 +8,8 @@ use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = "clear-launcher";
 pub const SETTINGS_FILE: &str = "settings.yml";
+pub const BUILD_FOLDER_NAME: &str = "build";
+pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
@@ -103,7 +105,7 @@ fn execute_with_services(
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
     fetch_versions: impl FnOnce() -> Result<Vec<String>>,
-    install_version: impl FnOnce(&Path, &str) -> Result<InstalledVersion>,
+    install_version: impl FnOnce(&Path, &Path, &str) -> Result<InstalledVersion>,
 ) -> Result<()> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
@@ -113,8 +115,10 @@ fn execute_with_services(
                 bail!("unexpected argument for `versions`: `{extra}`");
             }
 
-            let settings = load_settings(cwd)?;
-            let launcher_root = settings.launcher_path_for(OperatingSystem::current()?, env_get)?;
+            let settings_context = load_settings_context(cwd)?;
+            let launcher_root = settings_context
+                .settings
+                .launcher_path_for(OperatingSystem::current()?, env_get)?;
             ensure_launcher_root(&launcher_root)?;
             let versions = fetch_versions()?;
             write_versions(&versions, stdout)
@@ -130,10 +134,16 @@ fn execute_with_services(
                 bail!("unexpected argument for `install`: `{extra}`");
             }
 
-            let settings = load_settings(cwd)?;
-            let launcher_root = settings.launcher_path_for(OperatingSystem::current()?, env_get)?;
+            let settings_context = load_settings_context(cwd)?;
+            let launcher_root = settings_context
+                .settings
+                .launcher_path_for(OperatingSystem::current()?, env_get)?;
             ensure_launcher_root(&launcher_root)?;
-            let installed = install_version(&launcher_root, &requested)?;
+            let installed = install_version(
+                &launcher_root,
+                &settings_context.versions_folder,
+                &requested,
+            )?;
             writeln!(stdout, "Installed {}", installed.id).context("failed to write install output")
         }
         Some(command) => bail!(
@@ -144,6 +154,15 @@ fn execute_with_services(
 }
 
 pub fn load_settings(cwd: &Path) -> Result<Settings> {
+    Ok(load_settings_context(cwd)?.settings)
+}
+
+struct SettingsContext {
+    settings: Settings,
+    versions_folder: PathBuf,
+}
+
+fn load_settings_context(cwd: &Path) -> Result<SettingsContext> {
     let path = find_settings_path(cwd).with_context(|| {
         format!(
             "`{SETTINGS_FILE}` was not found from `{}` or its parent directories",
@@ -152,7 +171,19 @@ pub fn load_settings(cwd: &Path) -> Result<Settings> {
     })?;
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("failed to read `{}`", path.display()))?;
-    serde_yaml::from_str(&contents).with_context(|| format!("failed to parse `{}`", path.display()))
+    let settings = serde_yaml::from_str(&contents)
+        .with_context(|| format!("failed to parse `{}`", path.display()))?;
+    let versions_folder = versions_folder_for_settings_path(&path);
+
+    Ok(SettingsContext {
+        settings,
+        versions_folder,
+    })
+}
+
+fn versions_folder_for_settings_path(settings_path: &Path) -> PathBuf {
+    let repo_root = settings_path.parent().unwrap_or_else(|| Path::new(""));
+    repo_root.join(BUILD_FOLDER_NAME).join(VERSIONS_FOLDER_NAME)
 }
 
 pub fn find_settings_path(start: &Path) -> Option<PathBuf> {
@@ -208,14 +239,21 @@ pub struct InstalledVersion {
 
 pub fn install_minecraft_version(
     launcher_root: &Path,
+    versions_folder: &Path,
     requested_version: &str,
 ) -> Result<InstalledVersion> {
     let mut downloader = HttpDownloader::new();
-    install_minecraft_version_with_downloader(launcher_root, requested_version, &mut downloader)
+    install_minecraft_version_with_downloader(
+        launcher_root,
+        versions_folder,
+        requested_version,
+        &mut downloader,
+    )
 }
 
 fn install_minecraft_version_with_downloader(
     launcher_root: &Path,
+    versions_folder: &Path,
     requested_version: &str,
     downloader: &mut impl Downloader,
 ) -> Result<InstalledVersion> {
@@ -228,7 +266,7 @@ fn install_minecraft_version_with_downloader(
     let version_data_json = downloader.download_string(&version_url)?;
     let version_data = parse_minecraft_version_data(&version_data_json)?;
 
-    let version_dir = launcher_root.join("versions").join(&version_id);
+    let version_dir = versions_folder.join(&version_id);
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("failed to create `{}`", version_dir.display()))?;
     fs::write(
@@ -620,7 +658,7 @@ cli_name: custom-launcher
             &test_env,
             &mut stdout,
             || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
-            |_, _| unreachable!("versions command should not install versions"),
+            |_, _, _| unreachable!("versions command should not install versions"),
         )
         .unwrap();
 
@@ -693,6 +731,7 @@ cli_name: custom-launcher
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
         let launcher_root = repo.path().join("launcher");
+        let versions_folder = repo.path().join("build").join("versions");
         fs::create_dir_all(&cwd).unwrap();
         fs::write(
             repo.path().join(SETTINGS_FILE),
@@ -707,8 +746,9 @@ cli_name: custom-launcher
             &test_env,
             &mut stdout,
             || unreachable!("install command should not fetch Fabric versions"),
-            |root, requested| {
+            |root, versions, requested| {
                 assert_eq!(root, launcher_root.as_path());
+                assert_eq!(versions, versions_folder.as_path());
                 assert_eq!(requested, "1.18");
                 assert!(root.is_dir());
                 Ok(InstalledVersion {
@@ -725,6 +765,7 @@ cli_name: custom-launcher
     fn installs_minecraft_version_files_from_manifest() {
         let repo = tempfile::tempdir().unwrap();
         let launcher_root = repo.path().join("launcher");
+        let versions_folder = repo.path().join("build").join("versions");
         let asset_hash = "abcdef0123456789abcdef0123456789abcdef01";
         let version_data = r#"
 {
@@ -784,19 +825,24 @@ cli_name: custom-launcher
             ),
         ]);
 
-        let installed =
-            install_minecraft_version_with_downloader(&launcher_root, "latest", &mut downloader)
-                .unwrap();
+        let installed = install_minecraft_version_with_downloader(
+            &launcher_root,
+            &versions_folder,
+            "latest",
+            &mut downloader,
+        )
+        .unwrap();
 
         assert_eq!(installed.id, "1.18.2");
         assert_eq!(
-            fs::read_to_string(launcher_root.join("versions/1.18.2/1.18.2.json")).unwrap(),
+            fs::read_to_string(versions_folder.join("1.18.2/1.18.2.json")).unwrap(),
             version_data
         );
         assert_eq!(
-            fs::read(launcher_root.join("versions/1.18.2/1.18.2.jar")).unwrap(),
+            fs::read(versions_folder.join("1.18.2/1.18.2.jar")).unwrap(),
             b"https://example.test/client.jar"
         );
+        assert!(!launcher_root.join("versions/1.18.2").exists());
         assert!(launcher_root.join("assets/indexes/1.18.json").is_file());
         assert_eq!(
             fs::read(
