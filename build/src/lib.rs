@@ -11,8 +11,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-pub const DEFAULT_CLI_NAME: &str = "clear-launcher";
-pub const SETTINGS_FILE: &str = "settings.yml";
+pub const DEFAULT_CLI_NAME: &str = env!("CLEAR_LAUNCHER_CLI_NAME");
+pub const DEFAULT_LINUX_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_LINUX");
+pub const DEFAULT_MACOS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_MACOS");
+pub const DEFAULT_WINDOWS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_WINDOWS");
 pub const CONFIG_FILE_NAME: &str = "config.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
@@ -21,19 +23,17 @@ pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versi
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct Settings {
-    pub launcher_path: LauncherPaths,
-    pub cli_name: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledSettings {
+    pub launcher_path: CompiledLauncherPaths,
+    pub cli_name: &'static str,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct LauncherPaths {
-    pub linux: Option<String>,
-    pub macos: Option<String>,
-    pub windows: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledLauncherPaths {
+    pub linux: &'static str,
+    pub macos: &'static str,
+    pub windows: &'static str,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -49,13 +49,18 @@ pub enum OperatingSystem {
     Windows,
 }
 
-impl Settings {
+pub const COMPILED_SETTINGS: CompiledSettings = CompiledSettings {
+    launcher_path: CompiledLauncherPaths {
+        linux: DEFAULT_LINUX_LAUNCHER_PATH,
+        macos: DEFAULT_MACOS_LAUNCHER_PATH,
+        windows: DEFAULT_WINDOWS_LAUNCHER_PATH,
+    },
+    cli_name: DEFAULT_CLI_NAME,
+};
+
+impl CompiledSettings {
     pub fn cli_name(&self) -> &str {
         self.cli_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or(DEFAULT_CLI_NAME)
     }
 
     pub fn launcher_path_for(
@@ -64,25 +69,17 @@ impl Settings {
         env_get: &impl Fn(&str) -> Option<String>,
     ) -> Result<PathBuf> {
         let raw_path = match os {
-            OperatingSystem::Linux => self
-                .launcher_path
-                .linux
-                .as_deref()
-                .unwrap_or("~/.config/clear-launcher"),
-            OperatingSystem::Macos => self
-                .launcher_path
-                .macos
-                .as_deref()
-                .unwrap_or("~/Library/Application Support/clear-launcher"),
-            OperatingSystem::Windows => self
-                .launcher_path
-                .windows
-                .as_deref()
-                .unwrap_or("%APPDATA%/clear-launcher"),
+            OperatingSystem::Linux => self.launcher_path.linux,
+            OperatingSystem::Macos => self.launcher_path.macos,
+            OperatingSystem::Windows => self.launcher_path.windows,
         };
 
         expand_path(raw_path, env_get)
     }
+}
+
+pub fn compiled_settings() -> CompiledSettings {
+    COMPILED_SETTINGS
 }
 
 impl OperatingSystem {
@@ -144,11 +141,8 @@ fn execute_with_services(
                 bail!("unexpected argument for `versions`: `{extra}`");
             }
 
-            write_log(stderr, format_args!("Loading launcher settings"))?;
-            let settings_context = load_settings_context(cwd)?;
-            let launcher_root = settings_context
-                .settings
-                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
             write_log(
                 stderr,
                 format_args!("Ensuring launcher path {}", launcher_root.display()),
@@ -182,11 +176,8 @@ fn execute_with_services(
             if let Some(alias) = install_request.alias.as_deref() {
                 write_log(stderr, format_args!("Using install alias `{alias}`"))?;
             }
-            write_log(stderr, format_args!("Loading launcher settings"))?;
-            let settings_context = load_settings_context(cwd)?;
-            let launcher_root = settings_context
-                .settings
-                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
             write_log(
                 stderr,
                 format_args!("Ensuring launcher path {}", launcher_root.display()),
@@ -231,11 +222,8 @@ fn execute_with_services(
                 stderr,
                 format_args!("Using offline username `{}`", run_request.username),
             )?;
-            write_log(stderr, format_args!("Loading launcher settings"))?;
-            let settings_context = load_settings_context(cwd)?;
-            let launcher_root = settings_context
-                .settings
-                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
             write_log(
                 stderr,
                 format_args!("Ensuring launcher path {}", launcher_root.display()),
@@ -262,12 +250,9 @@ fn execute_with_services(
             }
 
             write_log(stderr, format_args!("Configuring CLI path"))?;
-            write_log(stderr, format_args!("Loading launcher settings"))?;
-            let settings_context = load_settings_context(cwd)?;
-            let launcher_root = settings_context
-                .settings
-                .launcher_path_for(OperatingSystem::current()?, env_get)?;
-            let cli_name = settings_context.settings.cli_name();
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            let cli_name = COMPILED_SETTINGS.cli_name();
             write_log(stderr, format_args!("Installing `{cli_name}` into PATH"))?;
             let symlink_path =
                 configure_path(&launcher_root, cli_name, &current_exe()?, cwd, env_get)?;
@@ -288,11 +273,8 @@ fn execute_with_services(
             }
 
             write_log(stderr, format_args!("Unsetting CLI path"))?;
-            write_log(stderr, format_args!("Loading launcher settings"))?;
-            let settings_context = load_settings_context(cwd)?;
-            let launcher_root = settings_context
-                .settings
-                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
             write_log(
                 stderr,
                 format_args!("Reading path config from {}", launcher_root.display()),
@@ -422,34 +404,10 @@ fn set_run_username(username: &mut Option<String>, value: String) -> Result<()> 
     Ok(())
 }
 
-pub fn load_settings(cwd: &Path) -> Result<Settings> {
-    Ok(load_settings_context(cwd)?.settings)
-}
-
-struct SettingsContext {
-    settings: Settings,
-}
-
-fn load_settings_context(cwd: &Path) -> Result<SettingsContext> {
-    let path = find_settings_path(cwd).with_context(|| {
-        format!(
-            "`{SETTINGS_FILE}` was not found from `{}` or its parent directories",
-            cwd.display()
-        )
-    })?;
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read `{}`", path.display()))?;
-    let settings = serde_yaml::from_str(&contents)
-        .with_context(|| format!("failed to parse `{}`", path.display()))?;
-
-    Ok(SettingsContext { settings })
-}
-
-pub fn find_settings_path(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .map(|dir| dir.join(SETTINGS_FILE))
-        .find(|candidate| candidate.is_file())
+fn launcher_root_from_compiled_settings(
+    env_get: &impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf> {
+    COMPILED_SETTINGS.launcher_path_for(OperatingSystem::current()?, env_get)
 }
 
 pub fn ensure_launcher_root(launcher_root: &Path) -> Result<()> {
@@ -1734,43 +1692,40 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn test_env(key: &str) -> Option<String> {
-        match key {
-            "HOME" => Some("/home/player".to_owned()),
+    fn test_env_for<'a>(
+        home: &'a Path,
+        path: Option<&'a Path>,
+    ) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| match key {
+            "HOME" => Some(home.display().to_string()),
             "APPDATA" => Some("C:/Users/Player/AppData/Roaming".to_owned()),
+            "PATH" => path.map(|path| path.display().to_string()),
             _ => None,
         }
     }
 
-    #[test]
-    fn defaults_to_linux_launcher_path_from_recipe() {
-        let settings = Settings::default();
+    fn launcher_root_for_home(home: &Path) -> PathBuf {
+        let env = test_env_for(home, None);
+        COMPILED_SETTINGS
+            .launcher_path_for(OperatingSystem::current().unwrap(), &env)
+            .unwrap()
+    }
 
-        let path = settings
-            .launcher_path_for(OperatingSystem::Linux, &test_env)
+    #[test]
+    fn compiled_settings_expand_launcher_path_from_recipe() {
+        let home = Path::new("/home/player");
+        let env = test_env_for(home, None);
+
+        let path = COMPILED_SETTINGS
+            .launcher_path_for(OperatingSystem::Linux, &env)
             .unwrap();
 
         assert_eq!(path, PathBuf::from("/home/player/.config/clear-launcher"));
     }
 
     #[test]
-    fn parses_custom_settings() {
-        let settings: Settings = serde_yaml::from_str(
-            r#"
-launcher_path:
-  linux: "/tmp/minecraft"
-cli_name: custom-launcher
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(settings.cli_name(), "custom-launcher");
-        assert_eq!(
-            settings
-                .launcher_path_for(OperatingSystem::Linux, &test_env)
-                .unwrap(),
-            PathBuf::from("/tmp/minecraft")
-        );
+    fn compiled_settings_include_cli_name_from_recipe() {
+        assert_eq!(COMPILED_SETTINGS.cli_name(), DEFAULT_CLI_NAME);
     }
 
     #[test]
@@ -1801,23 +1756,26 @@ cli_name: custom-launcher
     }
 
     #[test]
-    fn versions_command_reads_settings_and_fetches_from_api() {
+    fn versions_command_uses_compiled_settings_and_fetches_from_api() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
-        let launcher_root = repo.path().join("launcher");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
         fs::create_dir_all(&cwd).unwrap();
         fs::write(
-            repo.path().join(SETTINGS_FILE),
-            format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
+            repo.path().join("settings.yml"),
+            "this: is not used at runtime",
         )
         .unwrap();
+
+        let env = test_env_for(&home, None);
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         execute_with_services(
             vec!["versions".to_owned()],
             &cwd,
-            &test_env,
+            &env,
             &mut stdout,
             &mut stderr,
             || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
@@ -1832,7 +1790,7 @@ cli_name: custom-launcher
             "0.19.3\n0.10.6+build.214\n"
         );
         let logs = String::from_utf8(stderr).unwrap();
-        assert!(logs.contains("Loading launcher settings"));
+        assert!(logs.contains("Using compiled launcher settings"));
         assert!(logs.contains("Fetching Fabric loader versions"));
         assert!(logs.contains("Finished listing versions"));
         assert!(launcher_root.is_dir());
@@ -1896,24 +1854,22 @@ cli_name: custom-launcher
     }
 
     #[test]
-    fn install_command_reads_settings_and_installs_requested_version() {
+    fn install_command_uses_compiled_settings_and_installs_requested_version() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
-        let launcher_root = repo.path().join("launcher");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
         let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         fs::create_dir_all(&cwd).unwrap();
-        fs::write(
-            repo.path().join(SETTINGS_FILE),
-            format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
-        )
-        .unwrap();
+
+        let env = test_env_for(&home, None);
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         execute_with_services(
             vec!["install".to_owned(), "1.18".to_owned()],
             &cwd,
-            &test_env,
+            &env,
             &mut stdout,
             &mut stderr,
             || unreachable!("install command should not fetch Fabric versions"),
@@ -1949,14 +1905,12 @@ cli_name: custom-launcher
     fn install_command_accepts_alias() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
-        let launcher_root = repo.path().join("launcher");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
         let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         fs::create_dir_all(&cwd).unwrap();
-        fs::write(
-            repo.path().join(SETTINGS_FILE),
-            format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
-        )
-        .unwrap();
+
+        let env = test_env_for(&home, None);
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1968,7 +1922,7 @@ cli_name: custom-launcher
                 "survival".to_owned(),
             ],
             &cwd,
-            &test_env,
+            &env,
             &mut stdout,
             &mut stderr,
             || unreachable!("install command should not fetch Fabric versions"),
@@ -2001,17 +1955,15 @@ cli_name: custom-launcher
     }
 
     #[test]
-    fn run_command_reads_settings_and_runs_requested_version() {
+    fn run_command_uses_compiled_settings_and_runs_requested_version() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
-        let launcher_root = repo.path().join("launcher");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
         let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         fs::create_dir_all(&cwd).unwrap();
-        fs::write(
-            repo.path().join(SETTINGS_FILE),
-            format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
-        )
-        .unwrap();
+
+        let env = test_env_for(&home, None);
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2025,7 +1977,7 @@ cli_name: custom-launcher
                 "Player_1".to_owned(),
             ],
             &cwd,
-            &test_env,
+            &env,
             &mut stdout,
             &mut stderr,
             || unreachable!("run command should not fetch Fabric versions"),
@@ -2212,7 +2164,8 @@ cli_name: custom-launcher
     fn configure_and_unset_path_manage_symlink_config() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
-        let launcher_root = repo.path().join("launcher");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
         let bin_dir = repo.path().join("bin");
         let exe_path = repo
             .path()
@@ -2223,21 +2176,8 @@ cli_name: custom-launcher
         fs::create_dir_all(&bin_dir).unwrap();
         fs::create_dir_all(exe_path.parent().unwrap()).unwrap();
         fs::write(&exe_path, "binary").unwrap();
-        fs::write(
-            repo.path().join(SETTINGS_FILE),
-            format!(
-                "launcher_path:\n  linux: \"{}\"\ncli_name: custom-launcher\n",
-                launcher_root.display()
-            ),
-        )
-        .unwrap();
 
-        let env = |key: &str| match key {
-            "HOME" => Some("/home/player".to_owned()),
-            "APPDATA" => Some("C:/Users/Player/AppData/Roaming".to_owned()),
-            "PATH" => Some(bin_dir.display().to_string()),
-            _ => None,
-        };
+        let env = test_env_for(&home, Some(&bin_dir));
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -2254,7 +2194,8 @@ cli_name: custom-launcher
         )
         .unwrap();
 
-        let symlink_path = bin_dir.join("custom-launcher");
+        let cli_name = COMPILED_SETTINGS.cli_name();
+        let symlink_path = bin_dir.join(cli_name);
         assert_eq!(fs::read_link(&symlink_path).unwrap(), exe_path);
         assert_eq!(
             load_launcher_config(&launcher_root.join(CONFIG_FILE_NAME))
@@ -2264,7 +2205,7 @@ cli_name: custom-launcher
         );
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            format!("Configured custom-launcher at {}\n", symlink_path.display())
+            format!("Configured {cli_name} at {}\n", symlink_path.display())
         );
         let logs = String::from_utf8(stderr).unwrap();
         assert!(logs.contains("Configuring CLI path"));

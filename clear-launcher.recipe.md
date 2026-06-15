@@ -4,7 +4,7 @@ Clear code minecraft launcher
 
 ## Glossary
 
-**Compilation Settings File:** `settings.yml` file located on this repository
+**Compilation Settings File:** `settings.yml` file located on this repository, this is a **BUILD ONLY** file and **MUST NOT** be referenced at runtime, for runtime stuff use the **Config File**
 **Build Folder:** Folder where the output source code will be located
 **CLI Name:** Nombre con el cual será instalada la CLI
 **Versions Folder:**  {Launcher Path}/versions - Folder where minecraft versions are installed
