@@ -45,4 +45,6 @@ Rust Minecraft Launcher CLI that manages minecraft versions and run them in offl
 
 **Usage:** `{CLI Name} versions`
 
-List all existing minecraft versions directly from the minecraft API
+List all existing Fabric versions
+
+###

@@ -7,8 +7,7 @@ use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = "clear-launcher";
 pub const SETTINGS_FILE: &str = "settings.yml";
-pub const VERSION_MANIFEST_URL: &str =
-    "https://launchermeta.mojang.com/mc/game/version_manifest.json";
+pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -85,7 +84,7 @@ pub fn execute(
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
 ) -> Result<()> {
-    execute_with_version_fetcher(args, cwd, env_get, stdout, fetch_minecraft_versions)
+    execute_with_version_fetcher(args, cwd, env_get, stdout, fetch_fabric_loader_versions)
 }
 
 fn execute_with_version_fetcher(
@@ -137,46 +136,38 @@ pub fn ensure_launcher_root(launcher_root: &Path) -> Result<()> {
         .with_context(|| format!("failed to create `{}`", launcher_root.display()))
 }
 
-pub fn fetch_minecraft_versions() -> Result<Vec<String>> {
+pub fn fetch_fabric_loader_versions() -> Result<Vec<String>> {
     let user_agent = format!("{DEFAULT_CLI_NAME}/{}", env!("CARGO_PKG_VERSION"));
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .user_agent(&user_agent)
         .build();
 
-    let response = agent.get(VERSION_MANIFEST_URL).call().with_context(|| {
-        format!("failed to request Minecraft version manifest from `{VERSION_MANIFEST_URL}`")
-    })?;
+    let response = agent
+        .get(FABRIC_LOADER_VERSIONS_URL)
+        .call()
+        .with_context(|| {
+            format!("failed to request Fabric loader versions from `{FABRIC_LOADER_VERSIONS_URL}`")
+        })?;
 
-    let manifest = response
+    let versions = response
         .into_string()
-        .context("failed to read Minecraft version manifest response")?;
-    parse_minecraft_versions_manifest(&manifest)
+        .context("failed to read Fabric loader versions response")?;
+    parse_fabric_loader_versions(&versions)
 }
 
-pub fn parse_minecraft_versions_manifest(manifest: &str) -> Result<Vec<String>> {
-    let manifest: VersionManifest =
-        serde_json::from_str(manifest).context("failed to parse Minecraft version manifest")?;
-    Ok(manifest.into_version_ids())
-}
-
-#[derive(Debug, Deserialize)]
-struct VersionManifest {
-    versions: Vec<ManifestVersion>,
-}
-
-impl VersionManifest {
-    fn into_version_ids(self) -> Vec<String> {
-        self.versions
-            .into_iter()
-            .map(|version| version.id)
-            .collect()
-    }
+pub fn parse_fabric_loader_versions(versions: &str) -> Result<Vec<String>> {
+    let versions: Vec<FabricLoaderVersion> = serde_json::from_str(versions)
+        .context("failed to parse Fabric loader versions response")?;
+    Ok(versions
+        .into_iter()
+        .map(|version| version.version)
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
-struct ManifestVersion {
-    id: String,
+struct FabricLoaderVersion {
+    version: String,
 }
 
 pub fn expand_path(raw_path: &str, env_get: &impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
@@ -254,36 +245,30 @@ cli_name: custom-launcher
     }
 
     #[test]
-    fn parses_minecraft_versions_manifest_in_api_order() {
-        let versions = parse_minecraft_versions_manifest(
+    fn parses_fabric_loader_versions_in_api_order() {
+        let versions = parse_fabric_loader_versions(
             r#"
-{
-  "latest": {
-    "release": "1.20.4",
-    "snapshot": "23w13a_or_b"
+[
+  {
+    "separator": ".",
+    "build": 3,
+    "maven": "net.fabricmc:fabric-loader:0.19.3",
+    "version": "0.19.3",
+    "stable": true
   },
-  "versions": [
-    {
-      "id": "1.20.4",
-      "type": "release",
-      "url": "https://example.test/1.20.4.json",
-      "time": "2024-01-01T00:00:00+00:00",
-      "releaseTime": "2024-01-01T00:00:00+00:00"
-    },
-    {
-      "id": "23w13a_or_b",
-      "type": "snapshot",
-      "url": "https://example.test/23w13a_or_b.json",
-      "time": "2023-04-01T00:00:00+00:00",
-      "releaseTime": "2023-04-01T00:00:00+00:00"
-    }
-  ]
-}
+  {
+    "separator": "+build.",
+    "build": 214,
+    "maven": "net.fabricmc:fabric-loader:0.10.6+build.214",
+    "version": "0.10.6+build.214",
+    "stable": false
+  }
+]
 "#,
         )
         .unwrap();
 
-        assert_eq!(versions, vec!["1.20.4", "23w13a_or_b"]);
+        assert_eq!(versions, vec!["0.19.3", "0.10.6+build.214"]);
     }
 
     #[test]
@@ -304,11 +289,14 @@ cli_name: custom-launcher
             &cwd,
             &test_env,
             &mut stdout,
-            || Ok(vec!["1.20.1".to_owned(), "23w13a_or_b".to_owned()]),
+            || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
         )
         .unwrap();
 
-        assert_eq!(String::from_utf8(stdout).unwrap(), "1.20.1\n23w13a_or_b\n");
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "0.19.3\n0.10.6+build.214\n"
+        );
         assert!(launcher_root.is_dir());
     }
 }
