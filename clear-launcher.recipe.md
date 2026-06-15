@@ -1,0 +1,48 @@
+# Clear Launcher
+
+Clear code minecraft launcher
+
+## Glossary
+
+**Compilation Settings File:** `settings.yml` file located on this repository
+**Build Folder:** Folder where the output source code will be located
+**CLI Name:** Nombre con el cual será instalada la CLI
+
+## 1. Compilation Settings
+
+Compilation settings are defined in the `settings.yml` file, that must follow the following properties:
+
+| **Property**              | **Description**                                    | **Required** | **Default**                                  |
+| ------------------------- | -------------------------------------------------- | ------------ | -------------------------------------------- |
+| **launcher_path**         | Path of the .minecraft versions folders on each OS | no           |                                              |
+| **launcher_path.linux**   | Launcher path on linux                             | no           | ~/.config/clear-launcher                     |
+| **launcher_path.macos**   | Launcher path on macos                             | no           | ~/Library/Application Support/clear-launcher |
+| **launcher_path.windows** | Launcher path on windows                           | no           | %APPDATA%/clear-launcher                     |
+| **cli_name**              | Name that the CLI will have when compiled          | no           | clear-launcher                               |
+
+## 2. Stack
+
+**CLI:** Rust
+
+## 3. Sources
+
+**Inside a Minecraft Launcher:** ./sources/inside-a-minecraft-launcher.md
+
+## 4. Building
+
+1. Verify that the necessary tools for building are available, ex. `cargo` for rust, if not, abort
+2. Verify that the **Compilation Settings File** exists and its valid, if not, abort
+3. Read the **Inside a Minecraft Launcher** source
+4. Build the features described at the **App** section in the **Build Folder**, ensure no files are written outside it on the compilation process
+
+## 5. App
+
+Rust Minecraft Launcher CLI that manages minecraft versions and run them in offline mode, it contains the following commands & capabilities.
+
+**Note:** Most commands require the **launcher_path** folder to exist, if it doesnt exist at runtime it must create it automatically
+
+### 1. [Command] Listing versions
+
+**Usage:** `{CLI Name} versions`
+
+List all existing minecraft versions directly from the minecraft API
