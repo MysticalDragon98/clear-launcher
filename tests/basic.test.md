@@ -75,7 +75,43 @@ Expected result:
 - `test.json` is a merged Minecraft/Fabric launch profile.
 - Fabric loader libraries are installed under `{Launcher Path}/libraries`.
 
-## 3. Running Minecraft
+## 3. Creating Mods
+
+Disable editor launching for the unattended test:
+
+```sh
+mkdir -p "$LAUNCHER_ROOT"
+printf 'editor: clear-launcher-editor-that-does-not-exist\n' > "$LAUNCHER_ROOT/config.yml"
+```
+
+Execute the create mod command:
+
+```sh
+HOME="$TEST_HOME" "$CLI" create mod test-mod --version "$INSTALLED_VERSION" > "$TEST_HOME/create-mod.out" 2> "$TEST_HOME/create-mod.err"
+```
+
+Verify:
+
+```sh
+MOD_DIR="$LAUNCHER_ROOT/mods/test-mod"
+test -d "$MOD_DIR"
+test -d "$MOD_DIR/.git"
+test -f "$MOD_DIR/mod.yml"
+test -f "$MOD_DIR/build.gradle"
+test -f "$MOD_DIR/settings.gradle"
+test -f "$MOD_DIR/src/main/resources/fabric.mod.json"
+grep -q "minecraft_version: $INSTALLED_VERSION" "$MOD_DIR/mod.yml"
+grep -q "Editor command" "$TEST_HOME/create-mod.err"
+```
+
+Expected result:
+
+- The mod project is created under `{My Mods Folder}/test-mod`, which defaults to `{Launcher Path}/mods/test-mod`.
+- `mod.yml`, Gradle files, `fabric.mod.json`, and a Java entrypoint are created.
+- A git repository is initialized.
+- The missing editor command is logged and does not fail the command.
+
+## 4. Running Minecraft
 
 The `run` command requires an offline username.
 

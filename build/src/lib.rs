@@ -2,14 +2,14 @@ use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = env!("CLEAR_LAUNCHER_CLI_NAME");
@@ -21,8 +21,13 @@ pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const MODS_FOLDER_NAME: &str = "mods";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
+pub const DEFAULT_EDITOR: &str = "code";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 pub const FABRIC_GAME_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/game";
+pub const FABRIC_YARN_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/yarn";
+pub const FABRIC_LOOM_MAVEN_METADATA_URL: &str =
+    "https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml";
+pub const GRADLE_CURRENT_VERSION_URL: &str = "https://services.gradle.org/versions/current";
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 
@@ -42,7 +47,16 @@ pub struct CompiledLauncherPaths {
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LauncherConfig {
+    #[serde(
+        rename = "path",
+        alias = "path_symlink",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub path_symlink: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mods_folder: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +99,30 @@ pub fn compiled_settings() -> CompiledSettings {
     COMPILED_SETTINGS
 }
 
+impl LauncherConfig {
+    pub fn editor_command(&self) -> &str {
+        self.editor
+            .as_deref()
+            .map(str::trim)
+            .filter(|editor| !editor.is_empty())
+            .unwrap_or(DEFAULT_EDITOR)
+    }
+
+    pub fn configured_mods_folder(&self, launcher_root: &Path) -> PathBuf {
+        self.mods_folder
+            .as_ref()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    launcher_root.join(path)
+                }
+            })
+            .unwrap_or_else(|| launcher_root.join(MODS_FOLDER_NAME))
+    }
+}
+
 impl OperatingSystem {
     pub fn current() -> Result<Self> {
         match std::env::consts::OS {
@@ -121,6 +159,7 @@ pub fn execute(
         |launcher_root, versions_folder, request| {
             run_minecraft_version_offline(launcher_root, versions_folder, request)
         },
+        |launcher_root, config, request| create_mod_project(launcher_root, config, request),
         current_exe_path,
     )
 }
@@ -134,6 +173,7 @@ fn execute_with_services(
     fetch_versions: impl FnOnce() -> Result<Vec<FabricMinecraftVersion>>,
     install_version: impl FnOnce(&Path, &Path, &InstallRequest) -> Result<InstalledVersion>,
     run_version: impl FnOnce(&Path, &Path, &RunRequest) -> Result<LaunchedVersion>,
+    create_mod: impl FnOnce(&Path, &LauncherConfig, &CreateModRequest) -> Result<CreatedMod>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<()> {
     let mut args = args.into_iter();
@@ -253,6 +293,86 @@ fn execute_with_services(
                 ),
             )
         }
+        Some("create") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `create`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown create target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let name = args.next().with_context(|| {
+                format!(
+                    "missing name for `create mod`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            let create_request = parse_create_mod_request(name, args)?;
+
+            write_log(
+                stderr,
+                format_args!("Preparing mod project `{}`", create_request.name),
+            )?;
+            match create_request.minecraft_version.as_deref() {
+                Some(version) => write_log(
+                    stderr,
+                    format_args!("Using requested Minecraft version `{version}`"),
+                )?,
+                None => write_log(stderr, format_args!("Using latest Minecraft release"))?,
+            }
+            if let Some(fabric_version) = create_request.fabric_version.as_deref() {
+                write_log(
+                    stderr,
+                    format_args!("Using requested Fabric loader `{fabric_version}`"),
+                )?;
+            }
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
+            ensure_launcher_root(&launcher_root)?;
+            let config_file = launcher_config_file(&launcher_root);
+            let config = load_launcher_config(&config_file)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Using my mods folder {}",
+                    config.configured_mods_folder(&launcher_root).display()
+                ),
+            )?;
+            write_log(
+                stderr,
+                format_args!("Using editor command `{}`", config.editor_command()),
+            )?;
+            let created = create_mod(&launcher_root, &config, &create_request)?;
+            write_created_mod_output(&created, stdout)?;
+            if created.editor_opened {
+                write_log(
+                    stderr,
+                    format_args!("Opened mod project with `{}`", config.editor_command()),
+                )?;
+            } else {
+                write_log(
+                    stderr,
+                    format_args!(
+                        "Editor command `{}` was not available",
+                        config.editor_command()
+                    ),
+                )?;
+            }
+            write_log(
+                stderr,
+                format_args!("Finished creating mod project `{}`", created.name),
+            )
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -326,6 +446,35 @@ pub struct RunRequest {
     pub username: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateModRequest {
+    pub name: String,
+    pub minecraft_version: Option<String>,
+    pub fabric_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedMod {
+    pub name: String,
+    pub path: PathBuf,
+    pub config: ModProjectConfig,
+    pub editor_opened: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ModProjectConfig {
+    pub name: String,
+    pub mod_id: String,
+    pub minecraft_version: String,
+    pub fabric_version: String,
+    pub yarn_mappings: String,
+    pub loom_version: String,
+    pub gradle_version: String,
+    pub java_version: u8,
+    pub maven_group: String,
+    pub main_class: String,
+}
+
 fn parse_install_request(
     requested_version: String,
     mut args: impl Iterator<Item = String>,
@@ -387,6 +536,42 @@ fn parse_run_request(
     })
 }
 
+fn parse_create_mod_request(
+    name: String,
+    mut args: impl Iterator<Item = String>,
+) -> Result<CreateModRequest> {
+    let mut minecraft_version = None;
+    let mut fabric_version = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--version" {
+            let value = args
+                .next()
+                .context("missing value for `--version` in `create mod`")?;
+            set_optional_version(&mut minecraft_version, value, "--version")?;
+        } else if let Some(value) = arg.strip_prefix("--version=") {
+            set_optional_version(&mut minecraft_version, value.to_owned(), "--version")?;
+        } else if arg == "--fabric" {
+            let value = args
+                .next()
+                .context("missing value for `--fabric` in `create mod`")?;
+            set_optional_version(&mut fabric_version, value, "--fabric")?;
+        } else if let Some(value) = arg.strip_prefix("--fabric=") {
+            set_optional_version(&mut fabric_version, value.to_owned(), "--fabric")?;
+        } else {
+            bail!("unexpected argument for `create mod`: `{arg}`");
+        }
+    }
+
+    validate_path_segment(&name, "mod name")?;
+
+    Ok(CreateModRequest {
+        name,
+        minecraft_version,
+        fabric_version,
+    })
+}
+
 fn set_install_alias(alias: &mut Option<String>, value: String) -> Result<()> {
     set_alias(alias, value, "install alias")
 }
@@ -410,6 +595,15 @@ fn set_run_username(username: &mut Option<String>, value: String) -> Result<()> 
     }
     validate_username(&value)?;
     *username = Some(value);
+    Ok(())
+}
+
+fn set_optional_version(slot: &mut Option<String>, value: String, flag: &str) -> Result<()> {
+    if slot.is_some() {
+        bail!("`{flag}` was provided more than once");
+    }
+    validate_version_token(&value, flag)?;
+    *slot = Some(value);
     Ok(())
 }
 
@@ -700,9 +894,30 @@ fn resolve_fabric_loader_version(
     downloader: &mut impl Downloader,
     minecraft_version: &str,
 ) -> Result<String> {
+    resolve_requested_fabric_loader_version(downloader, minecraft_version, None)
+}
+
+fn resolve_requested_fabric_loader_version(
+    downloader: &mut impl Downloader,
+    minecraft_version: &str,
+    requested_fabric_version: Option<&str>,
+) -> Result<String> {
     let versions_url = fabric_loader_versions_for_minecraft_url(minecraft_version);
     let versions = downloader.download_string(&versions_url)?;
     let versions = parse_fabric_loader_versions_for_minecraft_version(&versions)?;
+    if let Some(requested_fabric_version) = requested_fabric_version {
+        validate_version_token(requested_fabric_version, "Fabric loader version")?;
+        if versions
+            .iter()
+            .any(|version| version.version == requested_fabric_version)
+        {
+            return Ok(requested_fabric_version.to_owned());
+        }
+        bail!(
+            "Fabric loader `{requested_fabric_version}` is not compatible with Minecraft `{minecraft_version}`"
+        );
+    }
+
     select_fabric_loader_version(&versions)
         .with_context(|| {
             format!("no Fabric loader version found for Minecraft `{minecraft_version}`")
@@ -718,10 +933,506 @@ fn fabric_profile_url(minecraft_version: &str, loader_version: &str) -> String {
     format!("{FABRIC_LOADER_VERSIONS_URL}/{minecraft_version}/{loader_version}/profile/json")
 }
 
+fn fabric_yarn_versions_for_minecraft_url(minecraft_version: &str) -> String {
+    format!("{FABRIC_YARN_VERSIONS_URL}/{minecraft_version}?limit=1")
+}
+
+fn resolve_yarn_version(
+    downloader: &mut impl Downloader,
+    minecraft_version: &str,
+) -> Result<String> {
+    let versions_url = fabric_yarn_versions_for_minecraft_url(minecraft_version);
+    let versions = downloader.download_string(&versions_url)?;
+    let versions: Vec<FabricYarnVersion> =
+        serde_json::from_str(&versions).context("failed to parse Fabric Yarn versions response")?;
+    versions
+        .into_iter()
+        .next()
+        .with_context(|| format!("no Yarn mappings found for Minecraft `{minecraft_version}`"))
+        .map(|version| version.version)
+}
+
+#[derive(Debug, Deserialize)]
+struct FabricYarnVersion {
+    version: String,
+}
+
+fn fetch_fabric_loom_version(downloader: &mut impl Downloader) -> Result<String> {
+    let metadata = downloader.download_string(FABRIC_LOOM_MAVEN_METADATA_URL)?;
+    parse_maven_metadata_release(&metadata)
+        .context("Fabric Loom Maven metadata did not include a release or latest version")
+}
+
+fn parse_maven_metadata_release(metadata: &str) -> Option<String> {
+    extract_xml_tag(metadata, "release").or_else(|| extract_xml_tag(metadata, "latest"))
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    let value = xml[start..end].trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn fetch_gradle_current_version(downloader: &mut impl Downloader) -> Result<String> {
+    let version = downloader.download_string(GRADLE_CURRENT_VERSION_URL)?;
+    let version: GradleCurrentVersion = serde_json::from_str(&version)
+        .context("failed to parse Gradle current version response")?;
+    validate_version_token(&version.version, "Gradle version")?;
+    Ok(version.version)
+}
+
+#[derive(Debug, Deserialize)]
+struct GradleCurrentVersion {
+    version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricMinecraftVersion {
     pub minecraft_version: String,
     pub fabric_version: String,
+}
+
+pub fn create_mod_project(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    request: &CreateModRequest,
+) -> Result<CreatedMod> {
+    let mut downloader = HttpDownloader::new();
+    let mut commands = ProcessExternalCommands;
+    create_mod_project_with_services(
+        launcher_root,
+        config,
+        request,
+        &mut downloader,
+        &mut commands,
+    )
+}
+
+fn create_mod_project_with_services(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    request: &CreateModRequest,
+    downloader: &mut impl Downloader,
+    commands: &mut impl ExternalCommands,
+) -> Result<CreatedMod> {
+    validate_path_segment(&request.name, "mod name")?;
+
+    let mods_folder = config.configured_mods_folder(launcher_root);
+    let mod_dir = mods_folder.join(&request.name);
+    if mod_dir
+        .try_exists()
+        .with_context(|| format!("failed to inspect `{}`", mod_dir.display()))?
+    {
+        bail!("mod project already exists at `{}`", mod_dir.display());
+    }
+
+    let identity = ModIdentity::from_name(&request.name)?;
+    let project_config = resolve_mod_project_config(request, &identity, downloader)?;
+    fs::create_dir_all(&mod_dir)
+        .with_context(|| format!("failed to create `{}`", mod_dir.display()))?;
+    write_mod_project_files(&mod_dir, &project_config)?;
+    commands.git_init(&mod_dir)?;
+    let editor_opened = commands.open_editor(config.editor_command(), &mod_dir)?;
+
+    Ok(CreatedMod {
+        name: request.name.clone(),
+        path: mod_dir,
+        config: project_config,
+        editor_opened,
+    })
+}
+
+fn resolve_mod_project_config(
+    request: &CreateModRequest,
+    identity: &ModIdentity,
+    downloader: &mut impl Downloader,
+) -> Result<ModProjectConfig> {
+    let manifest = downloader.download_string(MINECRAFT_VERSION_MANIFEST_URL)?;
+    let manifest = parse_minecraft_version_manifest(&manifest)?;
+    let requested_version = request.minecraft_version.as_deref().unwrap_or("latest");
+    let selected = resolve_minecraft_version(&manifest, requested_version)?;
+    let minecraft_version = selected.id.clone();
+    validate_version_token(&minecraft_version, "Minecraft version")?;
+
+    let fabric_version = resolve_requested_fabric_loader_version(
+        downloader,
+        &minecraft_version,
+        request.fabric_version.as_deref(),
+    )?;
+    let yarn_mappings = resolve_yarn_version(downloader, &minecraft_version)?;
+    let loom_version = fetch_fabric_loom_version(downloader)?;
+    let gradle_version = fetch_gradle_current_version(downloader)?;
+    let java_version = java_release_for_minecraft_version(&minecraft_version);
+
+    Ok(ModProjectConfig {
+        name: request.name.clone(),
+        mod_id: identity.mod_id.clone(),
+        minecraft_version,
+        fabric_version,
+        yarn_mappings,
+        loom_version,
+        gradle_version,
+        java_version,
+        maven_group: identity.maven_group.clone(),
+        main_class: identity.main_class.clone(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModIdentity {
+    mod_id: String,
+    maven_group: String,
+    main_class: String,
+}
+
+impl ModIdentity {
+    fn from_name(name: &str) -> Result<Self> {
+        let mod_id = mod_id_from_name(name)?;
+        let package_segment = package_segment_from_mod_id(&mod_id);
+        let maven_group = format!("com.clearlauncher.{package_segment}");
+        let class_name = java_class_name_from_name(name);
+        let main_class = format!("{maven_group}.{class_name}");
+
+        Ok(Self {
+            mod_id,
+            maven_group,
+            main_class,
+        })
+    }
+}
+
+fn write_mod_project_files(project_dir: &Path, config: &ModProjectConfig) -> Result<()> {
+    write_project_file(
+        &project_dir.join("settings.gradle"),
+        &settings_gradle_contents(config),
+    )?;
+    write_project_file(
+        &project_dir.join("build.gradle"),
+        &build_gradle_contents(config),
+    )?;
+    write_project_file(
+        &project_dir.join("gradle.properties"),
+        &gradle_properties_contents(config),
+    )?;
+    write_project_file(
+        &project_dir.join("src/main/resources/fabric.mod.json"),
+        &fabric_mod_json_contents(config)?,
+    )?;
+    write_project_file(
+        &project_dir.join("mod.yml"),
+        &serde_yaml::to_string(config).context("failed to serialize mod config")?,
+    )?;
+    write_project_file(&project_dir.join(".gitignore"), gitignore_contents())?;
+
+    let source_path = config.main_class.replace('.', "/");
+    write_project_file(
+        &project_dir
+            .join("src/main/java")
+            .join(format!("{source_path}.java")),
+        &java_entrypoint_contents(config),
+    )
+}
+
+fn write_project_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    fs::write(path, contents).with_context(|| format!("failed to write `{}`", path.display()))
+}
+
+fn settings_gradle_contents(config: &ModProjectConfig) -> String {
+    format!(
+        r#"pluginManagement {{
+    repositories {{
+        maven {{
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }}
+        mavenCentral()
+        gradlePluginPortal()
+    }}
+}}
+
+rootProject.name = '{}'
+"#,
+        config.mod_id
+    )
+}
+
+fn build_gradle_contents(config: &ModProjectConfig) -> String {
+    let java_version = config.java_version;
+    format!(
+        r#"plugins {{
+    id 'fabric-loom' version "${{loom_version}}"
+    id 'maven-publish'
+}}
+
+version = project.mod_version
+group = project.maven_group
+
+base {{
+    archivesName = project.archive_base_name
+}}
+
+repositories {{
+}}
+
+dependencies {{
+    minecraft "com.mojang:minecraft:${{project.minecraft_version}}"
+    mappings "net.fabricmc:yarn:${{project.yarn_mappings}}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${{project.loader_version}}"
+}}
+
+processResources {{
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {{
+        expand "version": project.version
+    }}
+}}
+
+tasks.withType(JavaCompile).configureEach {{
+    it.options.release = {java_version}
+}}
+
+java {{
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_{java_version}
+    targetCompatibility = JavaVersion.VERSION_{java_version}
+}}
+"#
+    )
+}
+
+fn gradle_properties_contents(config: &ModProjectConfig) -> String {
+    format!(
+        r#"# Gradle
+org.gradle.jvmargs=-Xmx1G
+org.gradle.parallel=true
+gradle_version={}
+
+# Fabric
+minecraft_version={}
+yarn_mappings={}
+loader_version={}
+loom_version={}
+
+# Mod
+mod_version=1.0.0
+maven_group={}
+archive_base_name={}
+"#,
+        config.gradle_version,
+        config.minecraft_version,
+        config.yarn_mappings,
+        config.fabric_version,
+        config.loom_version,
+        config.maven_group,
+        config.mod_id
+    )
+}
+
+fn fabric_mod_json_contents(config: &ModProjectConfig) -> Result<String> {
+    let manifest = json!({
+        "schemaVersion": 1,
+        "id": config.mod_id,
+        "version": "${version}",
+        "name": config.name,
+        "description": format!("{} generated by clear-launcher.", config.name),
+        "environment": "*",
+        "entrypoints": {
+            "main": [
+                config.main_class
+            ]
+        },
+        "depends": {
+            "fabricloader": format!(">={}", config.fabric_version),
+            "minecraft": config.minecraft_version,
+            "java": format!(">={}", config.java_version)
+        }
+    });
+    serde_json::to_string_pretty(&manifest).context("failed to serialize Fabric mod manifest")
+}
+
+fn java_entrypoint_contents(config: &ModProjectConfig) -> String {
+    let package = config
+        .main_class
+        .rsplit_once('.')
+        .map(|(package, _)| package)
+        .unwrap_or("com.clearlauncher.mod");
+    let class_name = config
+        .main_class
+        .rsplit_once('.')
+        .map(|(_, class_name)| class_name)
+        .unwrap_or("GeneratedMod");
+
+    format!(
+        r#"package {package};
+
+import net.fabricmc.api.ModInitializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class {class_name} implements ModInitializer {{
+    public static final String MOD_ID = "{}";
+    public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+
+    @Override
+    public void onInitialize() {{
+        LOGGER.info("Initialized {{}}", MOD_ID);
+    }}
+}}
+"#,
+        config.mod_id
+    )
+}
+
+fn gitignore_contents() -> &'static str {
+    ".gradle/\nbuild/\nout/\n*.log\n"
+}
+
+fn mod_id_from_name(name: &str) -> Result<String> {
+    let mut mod_id = String::new();
+    let mut last_was_separator = false;
+    for character in name.chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_alphanumeric() || character == '_' {
+            mod_id.push(character);
+            last_was_separator = false;
+        } else if character == '-' || character.is_ascii_whitespace() {
+            if !last_was_separator && !mod_id.is_empty() {
+                mod_id.push('-');
+                last_was_separator = true;
+            }
+        }
+    }
+
+    while mod_id.ends_with('-') {
+        mod_id.pop();
+    }
+    if mod_id.is_empty() {
+        bail!("mod name must contain at least one ASCII letter or number");
+    }
+    if !mod_id
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase())
+    {
+        mod_id.insert_str(0, "mod-");
+    }
+    Ok(mod_id)
+}
+
+fn package_segment_from_mod_id(mod_id: &str) -> String {
+    let mut segment = mod_id.replace('-', "_");
+    if segment
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        segment.insert_str(0, "mod_");
+    }
+    segment
+}
+
+fn java_class_name_from_name(name: &str) -> String {
+    let mut class_name = String::new();
+    for part in name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+    {
+        let mut characters = part.chars();
+        if let Some(first) = characters.next() {
+            class_name.push(first.to_ascii_uppercase());
+            for character in characters {
+                class_name.push(character.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if class_name.is_empty() {
+        class_name.push_str("GeneratedMod");
+    } else if class_name
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        class_name.insert_str(0, "Mod");
+    }
+    class_name
+}
+
+fn java_release_for_minecraft_version(version: &str) -> u8 {
+    let parts = version
+        .split('-')
+        .next()
+        .unwrap_or(version)
+        .split('.')
+        .map(|part| part.parse::<u16>().ok())
+        .collect::<Vec<_>>();
+    let major = parts.first().and_then(|part| *part).unwrap_or_default();
+    let minor = parts.get(1).and_then(|part| *part).unwrap_or_default();
+    let patch = parts.get(2).and_then(|part| *part).unwrap_or_default();
+
+    if major >= 26 {
+        25
+    } else if minor <= 16 {
+        8
+    } else if minor == 17 {
+        16
+    } else if minor <= 19 || (minor == 20 && patch <= 4) {
+        17
+    } else {
+        21
+    }
+}
+
+trait ExternalCommands {
+    fn git_init(&mut self, project_dir: &Path) -> Result<()>;
+    fn open_editor(&mut self, editor: &str, project_dir: &Path) -> Result<bool>;
+}
+
+struct ProcessExternalCommands;
+
+impl ExternalCommands for ProcessExternalCommands {
+    fn git_init(&mut self, project_dir: &Path) -> Result<()> {
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(project_dir)
+            .status()
+            .context("failed to start `git init`")?;
+        if !status.success() {
+            match status.code() {
+                Some(code) => bail!("`git init` exited with status code {code}"),
+                None => bail!("`git init` was terminated by signal"),
+            }
+        }
+        Ok(())
+    }
+
+    fn open_editor(&mut self, editor: &str, project_dir: &Path) -> Result<bool> {
+        let mut parts = editor.split_whitespace();
+        let Some(program) = parts.next() else {
+            return Ok(false);
+        };
+        match Command::new(program)
+            .args(parts)
+            .arg(project_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("failed to start `{editor}`")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1920,6 +2631,22 @@ fn validate_username(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_version_token(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    if value.trim() != value {
+        bail!("{label} cannot contain leading or trailing whitespace");
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character == '/' || character == '\\')
+    {
+        bail!("{label} cannot contain whitespace or path separators");
+    }
+    Ok(())
+}
+
 fn write_versions(versions: &[FabricMinecraftVersion], stdout: &mut impl Write) -> Result<()> {
     for version in versions {
         writeln!(
@@ -1952,13 +2679,23 @@ fn write_run_output(launched: &LaunchedVersion, stdout: &mut impl Write) -> Resu
     .context("failed to write run output")
 }
 
+fn write_created_mod_output(created: &CreatedMod, stdout: &mut impl Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "Created mod {} at {}",
+        created.name,
+        created.path.display()
+    )
+    .context("failed to write create mod output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -2001,6 +2738,51 @@ mod tests {
     #[test]
     fn compiled_settings_include_cli_name_from_recipe() {
         assert_eq!(COMPILED_SETTINGS.cli_name(), DEFAULT_CLI_NAME);
+    }
+
+    #[test]
+    fn launcher_config_uses_recipe_fields_and_defaults() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let config_file = launcher_root.join(CONFIG_FILE_NAME);
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::write(
+            &config_file,
+            "path: /tmp/clear-launcher\neditor: idea\nmods_folder: my-mods\n",
+        )
+        .unwrap();
+
+        let config = load_launcher_config(&config_file).unwrap();
+
+        assert_eq!(
+            config.path_symlink,
+            Some(PathBuf::from("/tmp/clear-launcher"))
+        );
+        assert_eq!(config.editor_command(), "idea");
+        assert_eq!(
+            config.configured_mods_folder(&launcher_root),
+            launcher_root.join("my-mods")
+        );
+
+        let default_config = LauncherConfig::default();
+        assert_eq!(default_config.editor_command(), DEFAULT_EDITOR);
+        assert_eq!(
+            default_config.configured_mods_folder(&launcher_root),
+            launcher_root.join(MODS_FOLDER_NAME)
+        );
+
+        let saved_config_file = repo.path().join("saved.yml");
+        save_launcher_config(
+            &saved_config_file,
+            &LauncherConfig {
+                path_symlink: Some(PathBuf::from("/tmp/clear-launcher")),
+                ..LauncherConfig::default()
+            },
+        )
+        .unwrap();
+        let saved = fs::read_to_string(saved_config_file).unwrap();
+        assert!(saved.contains("path: /tmp/clear-launcher"));
+        assert!(!saved.contains("path_symlink"));
     }
 
     #[test]
@@ -2088,6 +2870,7 @@ mod tests {
             },
             |_, _, _| unreachable!("versions command should not install versions"),
             |_, _, _| unreachable!("versions command should not run versions"),
+            |_, _, _| unreachable!("versions command should not create mods"),
             || unreachable!("versions command should not inspect the current executable"),
         )
         .unwrap();
@@ -2101,6 +2884,231 @@ mod tests {
         assert!(logs.contains("Fetching Fabric-supported Minecraft versions"));
         assert!(logs.contains("Finished listing versions"));
         assert!(launcher_root.is_dir());
+    }
+
+    #[test]
+    fn create_mod_command_uses_config_and_options() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
+        let mods_folder = repo.path().join("configured-mods");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::write(
+            launcher_root.join(CONFIG_FILE_NAME),
+            format!(
+                "editor: test-editor\nmods_folder: {}\n",
+                mods_folder.display()
+            ),
+        )
+        .unwrap();
+
+        let env = test_env_for(&home, None);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        execute_with_services(
+            vec![
+                "create".to_owned(),
+                "mod".to_owned(),
+                "Cool Blocks".to_owned(),
+                "--version".to_owned(),
+                "1.20.4".to_owned(),
+                "--fabric=0.16.14".to_owned(),
+            ],
+            &cwd,
+            &env,
+            &mut stdout,
+            &mut stderr,
+            || unreachable!("create mod command should not fetch Fabric versions"),
+            |_, _, _| unreachable!("create mod command should not install versions"),
+            |_, _, _| unreachable!("create mod command should not run versions"),
+            |root, config, request| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(config.editor_command(), "test-editor");
+                assert_eq!(config.configured_mods_folder(root), mods_folder);
+                assert_eq!(
+                    request,
+                    &CreateModRequest {
+                        name: "Cool Blocks".to_owned(),
+                        minecraft_version: Some("1.20.4".to_owned()),
+                        fabric_version: Some("0.16.14".to_owned()),
+                    }
+                );
+                Ok(CreatedMod {
+                    name: request.name.clone(),
+                    path: config.configured_mods_folder(root).join(&request.name),
+                    config: sample_mod_project_config(),
+                    editor_opened: true,
+                })
+            },
+            || unreachable!("create mod command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Created mod Cool Blocks at {}\n",
+                mods_folder.join("Cool Blocks").display()
+            )
+        );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Preparing mod project `Cool Blocks`"));
+        assert!(logs.contains("Using requested Minecraft version `1.20.4`"));
+        assert!(logs.contains("Using requested Fabric loader `0.16.14`"));
+        assert!(logs.contains("Opened mod project with `test-editor`"));
+    }
+
+    #[test]
+    fn creates_fabric_mod_project_from_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let request = CreateModRequest {
+            name: "Cool Blocks".to_owned(),
+            minecraft_version: None,
+            fabric_version: None,
+        };
+        let yarn_versions_url = fabric_yarn_versions_for_minecraft_url("1.21.8");
+        let loader_versions_url = fabric_loader_versions_for_minecraft_url("1.21.8");
+        let mut downloader = FakeDownloader::new([
+            (
+                MINECRAFT_VERSION_MANIFEST_URL,
+                r#"
+{
+  "latest": {
+    "release": "1.21.8",
+    "snapshot": "25w01a"
+  },
+  "versions": [
+    {
+      "id": "1.21.8",
+      "type": "release",
+      "url": "https://example.test/1.21.8.json"
+    }
+  ]
+}
+"#,
+            ),
+            (
+                loader_versions_url.as_str(),
+                r#"
+[
+  {
+    "loader": {
+      "version": "0.16.13",
+      "stable": false
+    }
+  },
+  {
+    "loader": {
+      "version": "0.16.14",
+      "stable": true
+    }
+  }
+]
+"#,
+            ),
+            (
+                yarn_versions_url.as_str(),
+                r#"
+[
+  {
+    "gameVersion": "1.21.8",
+    "version": "1.21.8+build.1"
+  }
+]
+"#,
+            ),
+            (
+                FABRIC_LOOM_MAVEN_METADATA_URL,
+                r#"
+<metadata>
+  <versioning>
+    <latest>1.17-SNAPSHOT</latest>
+    <release>1.17.11</release>
+  </versioning>
+</metadata>
+"#,
+            ),
+            (
+                GRADLE_CURRENT_VERSION_URL,
+                r#"
+{
+  "version": "9.5.1",
+  "current": true
+}
+"#,
+            ),
+        ]);
+        let mut commands = FakeExternalCommands::default();
+
+        let created = create_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &request,
+            &mut downloader,
+            &mut commands,
+        )
+        .unwrap();
+
+        let project_dir = launcher_root.join("mods").join("Cool Blocks");
+        assert_eq!(created.path, project_dir);
+        assert_eq!(created.config.mod_id, "cool-blocks");
+        assert_eq!(created.config.minecraft_version, "1.21.8");
+        assert_eq!(created.config.fabric_version, "0.16.14");
+        assert_eq!(created.config.yarn_mappings, "1.21.8+build.1");
+        assert_eq!(created.config.loom_version, "1.17.11");
+        assert_eq!(created.config.gradle_version, "9.5.1");
+        assert_eq!(created.config.java_version, 21);
+        assert!(created.editor_opened);
+        assert_eq!(commands.git_init_dirs, vec![project_dir.clone()]);
+        assert_eq!(
+            commands.editor_launches,
+            vec![(DEFAULT_EDITOR.to_owned(), project_dir.clone())]
+        );
+
+        assert!(project_dir.join("settings.gradle").is_file());
+        assert!(project_dir.join("build.gradle").is_file());
+        assert!(project_dir.join("gradle.properties").is_file());
+        assert!(project_dir.join("mod.yml").is_file());
+        assert!(
+            project_dir
+                .join("src/main/java/com/clearlauncher/cool_blocks/CoolBlocks.java")
+                .is_file()
+        );
+
+        let gradle_properties = fs::read_to_string(project_dir.join("gradle.properties")).unwrap();
+        assert!(gradle_properties.contains("minecraft_version=1.21.8"));
+        assert!(gradle_properties.contains("loader_version=0.16.14"));
+        assert!(gradle_properties.contains("loom_version=1.17.11"));
+        assert!(gradle_properties.contains("gradle_version=9.5.1"));
+
+        let mod_config = fs::read_to_string(project_dir.join("mod.yml")).unwrap();
+        assert!(mod_config.contains("minecraft_version: 1.21.8"));
+        assert!(mod_config.contains("fabric_version: 0.16.14"));
+
+        let fabric_mod: Value = serde_json::from_str(
+            &fs::read_to_string(project_dir.join("src/main/resources/fabric.mod.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fabric_mod.get("id").and_then(Value::as_str),
+            Some("cool-blocks")
+        );
+        assert_eq!(
+            fabric_mod
+                .pointer("/entrypoints/main/0")
+                .and_then(Value::as_str),
+            Some("com.clearlauncher.cool_blocks.CoolBlocks")
+        );
+        assert_eq!(
+            fabric_mod
+                .pointer("/depends/fabricloader")
+                .and_then(Value::as_str),
+            Some(">=0.16.14")
+        );
     }
 
     #[test]
@@ -2197,6 +3205,7 @@ mod tests {
                 })
             },
             |_, _, _| unreachable!("install command should not run versions"),
+            |_, _, _| unreachable!("install command should not create mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -2249,6 +3258,7 @@ mod tests {
                 })
             },
             |_, _, _| unreachable!("install command should not run versions"),
+            |_, _, _| unreachable!("install command should not create mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -2307,6 +3317,7 @@ mod tests {
                     username: requested.username.clone(),
                 })
             },
+            |_, _, _| unreachable!("run command should not create mods"),
             || unreachable!("run command should not inspect the current executable"),
         )
         .unwrap();
@@ -2505,6 +3516,7 @@ mod tests {
             || unreachable!("configure-path should not fetch Fabric versions"),
             |_, _, _| unreachable!("configure-path should not install versions"),
             |_, _, _| unreachable!("configure-path should not run versions"),
+            |_, _, _| unreachable!("configure-path should not create mods"),
             || Ok(exe_path.clone()),
         )
         .unwrap();
@@ -2537,6 +3549,7 @@ mod tests {
             || unreachable!("unset-path should not fetch Fabric versions"),
             |_, _, _| unreachable!("unset-path should not install versions"),
             |_, _, _| unreachable!("unset-path should not run versions"),
+            |_, _, _| unreachable!("unset-path should not create mods"),
             || unreachable!("unset-path should not inspect the current executable"),
         )
         .unwrap();
@@ -2869,8 +3882,57 @@ mod tests {
         assert!(error.to_string().contains("already installed"));
     }
 
+    fn sample_mod_project_config() -> ModProjectConfig {
+        ModProjectConfig {
+            name: "Cool Blocks".to_owned(),
+            mod_id: "cool-blocks".to_owned(),
+            minecraft_version: "1.20.4".to_owned(),
+            fabric_version: "0.16.14".to_owned(),
+            yarn_mappings: "1.20.4+build.3".to_owned(),
+            loom_version: "1.17.11".to_owned(),
+            gradle_version: "9.5.1".to_owned(),
+            java_version: 17,
+            maven_group: "com.clearlauncher.cool_blocks".to_owned(),
+            main_class: "com.clearlauncher.cool_blocks.CoolBlocks".to_owned(),
+        }
+    }
+
     struct FakeDownloader {
         strings: HashMap<String, String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeExternalCommands {
+        git_init_dirs: Vec<PathBuf>,
+        editor_launches: Vec<(String, PathBuf)>,
+        editor_available: bool,
+    }
+
+    impl Default for FakeExternalCommands {
+        fn default() -> Self {
+            Self {
+                git_init_dirs: Vec::new(),
+                editor_launches: Vec::new(),
+                editor_available: true,
+            }
+        }
+    }
+
+    impl ExternalCommands for FakeExternalCommands {
+        fn git_init(&mut self, project_dir: &Path) -> Result<()> {
+            self.git_init_dirs.push(project_dir.to_path_buf());
+            Ok(())
+        }
+
+        fn open_editor(&mut self, editor: &str, project_dir: &Path) -> Result<bool> {
+            if self.editor_available {
+                self.editor_launches
+                    .push((editor.to_owned(), project_dir.to_path_buf()));
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
 
     #[derive(Default)]

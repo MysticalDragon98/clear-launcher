@@ -10,10 +10,11 @@ Clear code minecraft launcher
 **Versions Folder:**  {Launcher Path}/versions - Folder where minecraft versions are installed
 **Config File:** {Launcher Path}/config.yml file that stores the local configuration
 **Version Folder:** Do not confuse with **Versions Folder**, the **Version Folder** is an specific installed version of minecraft at `{Versions Folder}/{version}/{alias}`
+**My Mods Folder:** Folder where downloaded and created mods lives, this is located on the **Config File**'s mods_folder property and defaults to `{Launcher Path}/mods`
 
-## 1. Compilation Settings
+## 1. Compilation Settings & Configuration File
 
-Compilation settings are defined in the `settings.yml` file, that must follow the following properties:
+Compilation settings are BUILD ONLY settings defined in the `settings.yml` file, that must follow the following properties:
 
 | **Property**              | **Description**                                    | **Required** | **Default**                                  |
 | ------------------------- | -------------------------------------------------- | ------------ | -------------------------------------------- |
@@ -23,23 +24,32 @@ Compilation settings are defined in the `settings.yml` file, that must follow th
 | **launcher_path.windows** | Launcher path on windows                           | no           | %APPDATA%/clear-launcher                     |
 | **cli_name**              | Name that the CLI will have when compiled          | no           | clear-launcher                               |
 
+Configuration file is defined at `{Launcher Path}/config.yml` and it is the runtime configuration for the CLI, it has the following properties
+
+| **Property** | **Description**                                    | **Required** | **Default** |
+| ------------ | -------------------------------------------------- | ------------ | ----------- |
+| **path**     | Path where the symlink of the PATH  file is stored | no           |             |
+| **editor**   | Editor command that will open the mods folder      | no           | code        |
+
 ## 2. Stack
 
 **CLI:** Rust
 
 
 
-## 3. Sources
+## no3. Sources
 
 **Inside a Minecraft Launcher:** ./sources/inside-a-minecraft-launcher.md
+**Fabric Documentation:** Read the context from https://docs.fabricmc.net
 
 ## 4. Building
 
 1. Verify that the necessary tools for building are available, ex. `cargo` for rust, if not, abort
 2. Verify that the **Compilation Settings File** exists and its valid, if not, abort
 3. Read the **Inside a Minecraft Launcher** source
-4. Build the features described at the **App** section in the **Build Folder**, ensure no files are written outside it on the compilation process
-5. Build the app with `cargo build` or equivalent
+4. Have **Fabric Documentation** at hand for any docs you need to research
+5. Build the features described at the **App** section in the **Build Folder**, ensure no files are written outside it on the compilation process
+6. Build the app with `cargo build` or equivalent
 
 ## 5. App
 
@@ -85,13 +95,37 @@ Alias provide ways to have different setups for the same version
 
 Runs the minecraft game in **offline** mode with the specified username, the version is resolved in the similar way of **install**
 
+
+
+6. [Command] Building Mods
+**Usag
+
+### 5. [Command] Creating Mods
+
+**Usage:** `{CLI Name} create mod {name} [--version {minecraft-version}] [--fabric {fabric-version}]`
+
+Creates a new mod project at `{My Mods Folder}/{name}` and opens it with the Config's **editor** command if available, and creates a mod.yml with the **Mod Configuration File** in that folder, then initializes a git repository
+
+The mod **must** follow this default configuration
+
+- **Minecraft Version:** Defaults to latest
+- **Fabric Version:** Defaults to the latest compatible with the minecraft version
+- **Loom Version:** Dependent of the Fabric Version
+- **Gradle Version:** Defaults to latest LTS
+
 ## 6. CLI Style
 
 **Verbosity:** The CLI by default logs everything that it's doing
-**Progress Bars:** All actions that can be measured with a progress bar (Quantificable) **MUST** be represented in an animated progress bar in order to let the user know what is the action that is doing and what's the progress on it
+**Progress Bars:** All actions that can be measured with a progress bar (Quantifnoicable) **MUST** be represented in an animated progress bar in order to let the user know what is the action that is doing and what's the progress on it
 
 
 
 ## 7. Mods
 
-Mods are scoped per **version** and belongs to a **Version Folder** at `{Version Folder}/mods`, the **Fabric Loader** must load the mods inside that folder when launching the minecraft version
+Mods are scoped per **version** and belongs to a **Version Folder** at `{Version Folder}/mods`, the **Fabric Loader** must load the mods inside that folder when launching the minecraft version.
+
+
+
+### My Mods
+
+My mods are local versions of mods that are stored in the **My Mods Folder** they are not installed in any version of the game, instead they contains folders with source code that can be modified and installed via mod commands
