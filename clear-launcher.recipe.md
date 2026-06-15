@@ -47,4 +47,12 @@ Rust Minecraft Launcher CLI that manages minecraft versions and run them in offl
 
 List all existing Fabric versions
 
-###
+### 2. [Command] Installing Versions
+
+**Usage:** `{CLI Name} install {version}|latest`
+
+Installs an specific minecraft version, that version can be one of the following:
+
+- **Specific version**
+- **Major Version:** ex. 1.18, in that case, it takes the last one
+- **Latest:** "latest" - Uses the latest version
