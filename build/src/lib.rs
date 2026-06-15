@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -20,6 +21,7 @@ pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
+pub const FABRIC_GAME_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/game";
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 
@@ -106,7 +108,7 @@ pub fn execute(
         env_get,
         stdout,
         stderr,
-        fetch_fabric_loader_versions,
+        fetch_fabric_minecraft_versions,
         |launcher_root, versions_folder, request| {
             install_minecraft_version_with_alias(
                 launcher_root,
@@ -128,7 +130,7 @@ fn execute_with_services(
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
-    fetch_versions: impl FnOnce() -> Result<Vec<String>>,
+    fetch_versions: impl FnOnce() -> Result<Vec<FabricMinecraftVersion>>,
     install_version: impl FnOnce(&Path, &Path, &InstallRequest) -> Result<InstalledVersion>,
     run_version: impl FnOnce(&Path, &Path, &RunRequest) -> Result<LaunchedVersion>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
@@ -148,11 +150,17 @@ fn execute_with_services(
                 format_args!("Ensuring launcher path {}", launcher_root.display()),
             )?;
             ensure_launcher_root(&launcher_root)?;
-            write_log(stderr, format_args!("Fetching Fabric loader versions"))?;
+            write_log(
+                stderr,
+                format_args!("Fetching Fabric-supported Minecraft versions"),
+            )?;
             let versions = fetch_versions()?;
             write_log(
                 stderr,
-                format_args!("Writing {} Fabric loader versions", versions.len()),
+                format_args!(
+                    "Writing {} Fabric-supported Minecraft versions",
+                    versions.len()
+                ),
             )?;
             write_versions(&versions, stdout)?;
             write_log(stderr, format_args!("Finished listing versions"))
@@ -603,38 +611,116 @@ fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("failed to determine current executable path")
 }
 
+pub fn fetch_fabric_minecraft_versions() -> Result<Vec<FabricMinecraftVersion>> {
+    let mut downloader = HttpDownloader::new();
+    fetch_fabric_minecraft_versions_with_downloader(&mut downloader)
+}
+
 pub fn fetch_fabric_loader_versions() -> Result<Vec<String>> {
-    let user_agent = format!("{DEFAULT_CLI_NAME}/{}", env!("CARGO_PKG_VERSION"));
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .user_agent(&user_agent)
-        .build();
-
-    let response = agent
-        .get(FABRIC_LOADER_VERSIONS_URL)
-        .call()
-        .with_context(|| {
-            format!("failed to request Fabric loader versions from `{FABRIC_LOADER_VERSIONS_URL}`")
-        })?;
-
-    let versions = response
-        .into_string()
-        .context("failed to read Fabric loader versions response")?;
+    let mut downloader = HttpDownloader::new();
+    let versions = downloader.download_string(FABRIC_LOADER_VERSIONS_URL)?;
     parse_fabric_loader_versions(&versions)
 }
 
-pub fn parse_fabric_loader_versions(versions: &str) -> Result<Vec<String>> {
-    let versions: Vec<FabricLoaderVersion> = serde_json::from_str(versions)
-        .context("failed to parse Fabric loader versions response")?;
+fn fetch_fabric_minecraft_versions_with_downloader(
+    downloader: &mut impl Downloader,
+) -> Result<Vec<FabricMinecraftVersion>> {
+    let game_versions = downloader.download_string(FABRIC_GAME_VERSIONS_URL)?;
+    let game_versions = parse_fabric_game_versions(&game_versions)?;
+    let loader_versions = downloader.download_string(FABRIC_LOADER_VERSIONS_URL)?;
+    let loader_versions = parse_fabric_loader_version_metadata(&loader_versions)?;
+    let fabric_version = select_fabric_loader_version(&loader_versions)
+        .context("Fabric loader versions response did not include any loader versions")?
+        .to_owned();
+
+    Ok(game_versions
+        .into_iter()
+        .map(|minecraft_version| FabricMinecraftVersion {
+            minecraft_version,
+            fabric_version: fabric_version.clone(),
+        })
+        .collect())
+}
+
+pub fn parse_fabric_game_versions(versions: &str) -> Result<Vec<String>> {
+    let versions: Vec<FabricGameVersion> =
+        serde_json::from_str(versions).context("failed to parse Fabric game versions response")?;
     Ok(versions
         .into_iter()
         .map(|version| version.version)
         .collect())
 }
 
+pub fn parse_fabric_loader_versions(versions: &str) -> Result<Vec<String>> {
+    Ok(parse_fabric_loader_version_metadata(versions)?
+        .into_iter()
+        .map(|version| version.version)
+        .collect())
+}
+
+fn parse_fabric_loader_version_metadata(versions: &str) -> Result<Vec<FabricLoaderVersion>> {
+    serde_json::from_str(versions).context("failed to parse Fabric loader versions response")
+}
+
 #[derive(Debug, Deserialize)]
+struct FabricGameVersion {
+    version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct FabricLoaderVersion {
     version: String,
+    #[serde(default)]
+    stable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FabricMinecraftLoaderVersion {
+    loader: FabricLoaderVersion,
+}
+
+fn parse_fabric_loader_versions_for_minecraft_version(
+    versions: &str,
+) -> Result<Vec<FabricLoaderVersion>> {
+    let versions: Vec<FabricMinecraftLoaderVersion> = serde_json::from_str(versions)
+        .context("failed to parse Fabric loader versions for Minecraft version response")?;
+    Ok(versions.into_iter().map(|version| version.loader).collect())
+}
+
+fn select_fabric_loader_version(versions: &[FabricLoaderVersion]) -> Option<&str> {
+    versions
+        .iter()
+        .find(|version| version.stable)
+        .or_else(|| versions.first())
+        .map(|version| version.version.as_str())
+}
+
+fn resolve_fabric_loader_version(
+    downloader: &mut impl Downloader,
+    minecraft_version: &str,
+) -> Result<String> {
+    let versions_url = fabric_loader_versions_for_minecraft_url(minecraft_version);
+    let versions = downloader.download_string(&versions_url)?;
+    let versions = parse_fabric_loader_versions_for_minecraft_version(&versions)?;
+    select_fabric_loader_version(&versions)
+        .with_context(|| {
+            format!("no Fabric loader version found for Minecraft `{minecraft_version}`")
+        })
+        .map(str::to_owned)
+}
+
+fn fabric_loader_versions_for_minecraft_url(minecraft_version: &str) -> String {
+    format!("{FABRIC_LOADER_VERSIONS_URL}/{minecraft_version}")
+}
+
+fn fabric_profile_url(minecraft_version: &str, loader_version: &str) -> String {
+    format!("{FABRIC_LOADER_VERSIONS_URL}/{minecraft_version}/{loader_version}/profile/json")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricMinecraftVersion {
+    pub minecraft_version: String,
+    pub fabric_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -805,16 +891,7 @@ fn build_launch_command(
             .collect();
     }
 
-    let game_templates = if let Some(arguments) = version_data.arguments.as_ref() {
-        collect_launch_arguments(&arguments.game)?
-    } else if let Some(arguments) = version_data.minecraft_arguments.as_deref() {
-        arguments
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    } else {
-        bail!("installed Minecraft version does not include launch arguments");
-    };
+    let game_templates = game_launch_arguments(&version_data)?;
     let game_args = game_templates
         .iter()
         .map(|argument| substitute_launch_argument(argument, &context))
@@ -832,6 +909,24 @@ fn build_launch_command(
     })
 }
 
+fn game_launch_arguments(version_data: &MinecraftVersionData) -> Result<Vec<String>> {
+    if let Some(arguments) = version_data.arguments.as_ref() {
+        let game_arguments = collect_launch_arguments(&arguments.game)?;
+        if !game_arguments.is_empty() || version_data.minecraft_arguments.is_none() {
+            return Ok(game_arguments);
+        }
+    }
+
+    if let Some(arguments) = version_data.minecraft_arguments.as_deref() {
+        return Ok(arguments
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>());
+    }
+
+    bail!("installed Minecraft version does not include launch arguments");
+}
+
 fn build_classpath(
     launcher_root: &Path,
     client_jar: &Path,
@@ -844,12 +939,7 @@ fn build_classpath(
         if !allowed_by_rules(library.rules.as_deref(), os) {
             continue;
         }
-        let Some(path) = library
-            .downloads
-            .as_ref()
-            .and_then(|downloads| downloads.artifact.as_ref())
-            .and_then(|artifact| artifact.path.as_deref())
-        else {
+        let Some(path) = library_artifact_path(library)? else {
             continue;
         };
 
@@ -1014,14 +1104,19 @@ fn install_minecraft_version_with_downloader(
         );
     }
 
+    let fabric_loader_version = resolve_fabric_loader_version(downloader, &version_id)?;
     let version_data_json = downloader.download_string(&version_url)?;
-    let version_data = parse_minecraft_version_data(&version_data_json)?;
+    let fabric_profile_url = fabric_profile_url(&version_id, &fabric_loader_version);
+    let fabric_profile_json = downloader.download_string(&fabric_profile_url)?;
+    let installed_version_json =
+        merge_minecraft_and_fabric_version_data(&version_data_json, &fabric_profile_json)?;
+    let version_data = parse_minecraft_version_data(&installed_version_json)?;
 
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("failed to create `{}`", version_dir.display()))?;
     fs::write(
         version_dir.join(format!("{install_name}.json")),
-        &version_data_json,
+        &installed_version_json,
     )
     .with_context(|| format!("failed to write version data for `{version_id}`"))?;
 
@@ -1049,6 +1144,115 @@ fn install_minecraft_version_with_downloader(
         id: version_id,
         alias: alias.map(str::to_owned),
     })
+}
+
+fn merge_minecraft_and_fabric_version_data(
+    minecraft_version_data: &str,
+    fabric_profile: &str,
+) -> Result<String> {
+    let mut merged: Value = serde_json::from_str(minecraft_version_data)
+        .context("failed to parse Minecraft version data")?;
+    let fabric: Value =
+        serde_json::from_str(fabric_profile).context("failed to parse Fabric loader profile")?;
+
+    copy_json_field(&mut merged, &fabric, "mainClass")?;
+    append_json_array_field(&mut merged, &fabric, "libraries")?;
+    append_fabric_launch_arguments(&mut merged, &fabric)?;
+
+    serde_json::to_string_pretty(&merged).context("failed to serialize merged Fabric version data")
+}
+
+fn copy_json_field(target: &mut Value, source: &Value, key: &str) -> Result<()> {
+    let Some(value) = source.get(key) else {
+        return Ok(());
+    };
+    let target = target
+        .as_object_mut()
+        .context("Minecraft version data must be a JSON object")?;
+    target.insert(key.to_owned(), value.clone());
+    Ok(())
+}
+
+fn append_json_array_field(target: &mut Value, source: &Value, key: &str) -> Result<()> {
+    let Some(source_value) = source.get(key) else {
+        return Ok(());
+    };
+    let source_values = source_value
+        .as_array()
+        .with_context(|| format!("Fabric loader profile `{key}` must be an array"))?;
+    if source_values.is_empty() {
+        return Ok(());
+    }
+
+    let target = target
+        .as_object_mut()
+        .context("Minecraft version data must be a JSON object")?;
+    let target_value = target
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let target_values = target_value
+        .as_array_mut()
+        .with_context(|| format!("Minecraft version data `{key}` must be an array"))?;
+    target_values.extend(source_values.iter().cloned());
+    Ok(())
+}
+
+fn append_fabric_launch_arguments(target: &mut Value, fabric: &Value) -> Result<()> {
+    let Some(arguments) = fabric.get("arguments") else {
+        return Ok(());
+    };
+    let arguments = arguments
+        .as_object()
+        .context("Fabric loader profile `arguments` must be a JSON object")?;
+    if arguments.is_empty() {
+        return Ok(());
+    }
+
+    let target_arguments = ensure_json_object_field(target, "arguments")?;
+    for key in ["jvm", "game"] {
+        append_argument_values(target_arguments, arguments, key)?;
+    }
+    Ok(())
+}
+
+fn ensure_json_object_field<'a>(
+    target: &'a mut Value,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>> {
+    let target = target
+        .as_object_mut()
+        .context("Minecraft version data must be a JSON object")?;
+    let value = target
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    value
+        .as_object_mut()
+        .with_context(|| format!("Minecraft version data `{key}` must be a JSON object"))
+}
+
+fn append_argument_values(
+    target_arguments: &mut Map<String, Value>,
+    source_arguments: &Map<String, Value>,
+    key: &str,
+) -> Result<()> {
+    let Some(source_value) = source_arguments.get(key) else {
+        return Ok(());
+    };
+    let source_values = source_value
+        .as_array()
+        .with_context(|| format!("Fabric loader profile `arguments.{key}` must be an array"))?;
+    if source_values.is_empty() {
+        return Ok(());
+    }
+
+    let target_value = target_arguments
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let target_values = target_value
+        .as_array_mut()
+        .with_context(|| format!("Minecraft version data `arguments.{key}` must be an array"))?;
+    target_values.extend(source_values.iter().cloned());
+    Ok(())
 }
 
 fn install_assets(
@@ -1087,6 +1291,68 @@ fn install_assets(
     Ok(())
 }
 
+fn library_artifact_path(library: &MinecraftLibrary) -> Result<Option<String>> {
+    if let Some(path) = library
+        .downloads
+        .as_ref()
+        .and_then(|downloads| downloads.artifact.as_ref())
+        .and_then(|artifact| artifact.path.as_deref())
+    {
+        return Ok(Some(path.to_owned()));
+    }
+
+    let Some(name) = library.name.as_deref() else {
+        return Ok(None);
+    };
+    if library.url.is_none() {
+        return Ok(None);
+    }
+
+    maven_artifact_path(name).map(Some)
+}
+
+fn library_artifact_download(library: &MinecraftLibrary) -> Result<Option<(String, String)>> {
+    if let Some(artifact) = library
+        .downloads
+        .as_ref()
+        .and_then(|downloads| downloads.artifact.as_ref())
+    {
+        if let Some(path) = artifact.path.as_deref() {
+            return Ok(Some((path.to_owned(), artifact.url.clone())));
+        }
+    }
+
+    let Some(name) = library.name.as_deref() else {
+        return Ok(None);
+    };
+    let Some(base_url) = library.url.as_deref() else {
+        return Ok(None);
+    };
+
+    let path = maven_artifact_path(name)?;
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), path);
+    Ok(Some((path, url)))
+}
+
+fn maven_artifact_path(coordinates: &str) -> Result<String> {
+    let parts = coordinates.split(':').collect::<Vec<_>>();
+    if !(parts.len() == 3 || parts.len() == 4) || parts.iter().any(|part| part.is_empty()) {
+        bail!("invalid Maven artifact coordinates `{coordinates}`");
+    }
+
+    let group = parts[0].replace('.', "/");
+    let artifact = parts[1];
+    let version = parts[2];
+    let classifier = parts
+        .get(3)
+        .map(|classifier| format!("-{classifier}"))
+        .unwrap_or_default();
+
+    Ok(format!(
+        "{group}/{artifact}/{version}/{artifact}-{version}{classifier}.jar"
+    ))
+}
+
 fn install_libraries(
     launcher_root: &Path,
     version_dir: &Path,
@@ -1101,15 +1367,8 @@ fn install_libraries(
             continue;
         }
 
-        if let Some(artifact) = library
-            .downloads
-            .as_ref()
-            .and_then(|downloads| downloads.artifact.as_ref())
-        {
-            if let Some(path) = artifact.path.as_deref() {
-                downloader
-                    .download_to_path(&artifact.url, &launcher_root.join("libraries").join(path))?;
-            }
+        if let Some((path, url)) = library_artifact_download(&library)? {
+            downloader.download_to_path(&url, &launcher_root.join("libraries").join(path))?;
         }
 
         if let Some(native) = native_library_download(&library, os) {
@@ -1553,6 +1812,7 @@ struct MinecraftLibrary {
     name: Option<String>,
     natives: Option<HashMap<String, String>>,
     rules: Option<Vec<MinecraftRule>>,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1650,9 +1910,14 @@ fn validate_username(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_versions(versions: &[String], stdout: &mut impl Write) -> Result<()> {
+fn write_versions(versions: &[FabricMinecraftVersion], stdout: &mut impl Write) -> Result<()> {
     for version in versions {
-        writeln!(stdout, "{version}").context("failed to write version output")?;
+        writeln!(
+            stdout,
+            "Minecraft {} - Fabric {}",
+            version.minecraft_version, version.fabric_version
+        )
+        .context("failed to write version output")?;
     }
     Ok(())
 }
@@ -1756,6 +2021,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_fabric_game_versions_in_api_order() {
+        let versions = parse_fabric_game_versions(
+            r#"
+[
+  {
+    "version": "1.20.4",
+    "stable": true
+  },
+  {
+    "version": "23w13a_or_b",
+    "stable": false
+  }
+]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(versions, vec!["1.20.4", "23w13a_or_b"]);
+    }
+
+    #[test]
     fn versions_command_uses_compiled_settings_and_fetches_from_api() {
         let repo = tempfile::tempdir().unwrap();
         let cwd = repo.path().join("build").join("nested");
@@ -1778,7 +2064,18 @@ mod tests {
             &env,
             &mut stdout,
             &mut stderr,
-            || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
+            || {
+                Ok(vec![
+                    FabricMinecraftVersion {
+                        minecraft_version: "1.20.4".to_owned(),
+                        fabric_version: "0.19.3".to_owned(),
+                    },
+                    FabricMinecraftVersion {
+                        minecraft_version: "23w13a_or_b".to_owned(),
+                        fabric_version: "0.19.3".to_owned(),
+                    },
+                ])
+            },
             |_, _, _| unreachable!("versions command should not install versions"),
             |_, _, _| unreachable!("versions command should not run versions"),
             || unreachable!("versions command should not inspect the current executable"),
@@ -1787,11 +2084,11 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
-            "0.19.3\n0.10.6+build.214\n"
+            "Minecraft 1.20.4 - Fabric 0.19.3\nMinecraft 23w13a_or_b - Fabric 0.19.3\n"
         );
         let logs = String::from_utf8(stderr).unwrap();
         assert!(logs.contains("Using compiled launcher settings"));
-        assert!(logs.contains("Fetching Fabric loader versions"));
+        assert!(logs.contains("Fetching Fabric-supported Minecraft versions"));
         assert!(logs.contains("Finished listing versions"));
         assert!(launcher_root.is_dir());
     }
@@ -2248,6 +2545,8 @@ mod tests {
         let launcher_root = repo.path().join("launcher");
         let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
         let asset_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        let loader_versions_url = fabric_loader_versions_for_minecraft_url("1.18.2");
+        let fabric_profile_endpoint = fabric_profile_url("1.18.2", "0.19.3");
         let version_data = r#"
 {
   "assetIndex": {
@@ -2267,6 +2566,23 @@ mod tests {
           "url": "https://example.test/lib-1.0.jar"
         }
       }
+    }
+  ]
+}
+"#;
+        let fabric_profile = r#"
+{
+  "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+  "arguments": {
+    "jvm": [
+      "-DFabricMcEmu= net.minecraft.client.main.Main "
+    ],
+    "game": []
+  },
+  "libraries": [
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3",
+      "url": "https://maven.fabricmc.net/"
     }
   ]
 }
@@ -2291,7 +2607,27 @@ mod tests {
 }
 "#,
             ),
+            (
+                loader_versions_url.as_str(),
+                r#"
+[
+  {
+    "loader": {
+      "version": "0.19.2",
+      "stable": false
+    }
+  },
+  {
+    "loader": {
+      "version": "0.19.3",
+      "stable": true
+    }
+  }
+]
+"#,
+            ),
             ("https://example.test/1.18.2.json", version_data),
+            (fabric_profile_endpoint.as_str(), fabric_profile),
             (
                 "https://example.test/assets/1.18.json",
                 &format!(
@@ -2316,9 +2652,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(installed.id, "1.18.2");
+        let installed_data: Value = serde_json::from_str(
+            &fs::read_to_string(versions_folder.join("1.18.2/default/default.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            fs::read_to_string(versions_folder.join("1.18.2/default/default.json")).unwrap(),
-            version_data
+            installed_data
+                .get("mainClass")
+                .and_then(Value::as_str)
+                .unwrap(),
+            "net.fabricmc.loader.impl.launch.knot.KnotClient"
+        );
+        assert_eq!(
+            installed_data
+                .pointer("/downloads/client/url")
+                .and_then(Value::as_str)
+                .unwrap(),
+            "https://example.test/client.jar"
+        );
+        assert!(
+            installed_data
+                .get("libraries")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|library| library.get("name").and_then(Value::as_str)
+                    == Some("net.fabricmc:fabric-loader:0.19.3"))
         );
         assert_eq!(
             fs::read(versions_folder.join("1.18.2/default/default.jar")).unwrap(),
@@ -2341,6 +2700,14 @@ mod tests {
             fs::read(launcher_root.join("libraries/org/example/lib/1.0/lib-1.0.jar")).unwrap(),
             b"https://example.test/lib-1.0.jar"
         );
+        assert_eq!(
+            fs::read(
+                launcher_root
+                    .join("libraries/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar")
+            )
+            .unwrap(),
+            b"https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar"
+        );
     }
 
     #[test]
@@ -2348,6 +2715,8 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let launcher_root = repo.path().join("launcher");
         let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        let loader_versions_url = fabric_loader_versions_for_minecraft_url("1.20.4");
+        let fabric_profile_endpoint = fabric_profile_url("1.20.4", "0.19.3");
         let version_data = r#"
 {
   "downloads": {
@@ -2355,6 +2724,17 @@ mod tests {
       "url": "https://example.test/client.jar"
     }
   }
+}
+"#;
+        let fabric_profile = r#"
+{
+  "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+  "libraries": [
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3",
+      "url": "https://maven.fabricmc.net/"
+    }
+  ]
 }
 "#;
 
@@ -2377,7 +2757,21 @@ mod tests {
 }
 "#,
             ),
+            (
+                loader_versions_url.as_str(),
+                r#"
+[
+  {
+    "loader": {
+      "version": "0.19.3",
+      "stable": true
+    }
+  }
+]
+"#,
+            ),
             ("https://example.test/1.20.4.json", version_data),
+            (fabric_profile_endpoint.as_str(), fabric_profile),
         ]);
 
         let installed = install_minecraft_version_with_downloader(
@@ -2397,12 +2791,22 @@ mod tests {
             }
         );
         assert_eq!(
-            fs::read_to_string(versions_folder.join("1.20.4/survival/survival.json")).unwrap(),
-            version_data
+            serde_json::from_str::<Value>(
+                &fs::read_to_string(versions_folder.join("1.20.4/survival/survival.json")).unwrap()
+            )
+            .unwrap()
+            .get("mainClass")
+            .and_then(Value::as_str),
+            Some("net.fabricmc.loader.impl.launch.knot.KnotClient")
         );
         assert_eq!(
             fs::read(versions_folder.join("1.20.4/survival/survival.jar")).unwrap(),
             b"https://example.test/client.jar"
+        );
+        assert!(
+            launcher_root
+                .join("libraries/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar")
+                .is_file()
         );
         assert!(!versions_folder.join("1.20.4/default").exists());
     }
