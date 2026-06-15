@@ -137,6 +137,14 @@ The process of installing a mod requires building the mod, so if no jar is built
 
 Installing a mod that is already installed on that **Version Folder** automatically replaces any old version of the mod, so it's effectively an update
 
+
+
+### 8. [Command] Downloading Mods from Git URL
+
+**Usage:** `{CLI Name} clone mod {git-url}`
+
+ Clones via git url a repository into `{My Mods Folder}/{name}`, if the folder already exists, abort. The name must be resolved from the mod.yml file and not from the repository name.  If the repository does not contains a valid mod.yml, abort.
+
 ## 6. CLI Style
 
 **Verbosity:** The CLI by default logs everything that it's doing

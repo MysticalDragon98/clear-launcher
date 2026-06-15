@@ -169,6 +169,7 @@ pub fn execute(
         |launcher_root, versions_folder, config, cwd, request| {
             install_mod_project(launcher_root, versions_folder, config, cwd, request)
         },
+        |launcher_root, config, request| clone_mod_project(launcher_root, config, request),
         current_exe_path,
     )
 }
@@ -191,6 +192,7 @@ fn execute_with_services(
         &Path,
         &InstallModRequest,
     ) -> Result<InstalledMod>,
+    clone_mod: impl FnOnce(&Path, &LauncherConfig, &CloneModRequest) -> Result<ClonedMod>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<()> {
     let mut args = args.into_iter();
@@ -497,6 +499,62 @@ fn execute_with_services(
                 ),
             )
         }
+        Some("clone") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `clone`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown clone target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let git_url = args.next().with_context(|| {
+                format!(
+                    "missing git URL for `clone mod`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            let clone_request = parse_clone_mod_request(git_url, args)?;
+
+            write_log(
+                stderr,
+                format_args!(
+                    "Preparing clone for mod repository `{}`",
+                    clone_request.git_url
+                ),
+            )?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
+            ensure_launcher_root(&launcher_root)?;
+            let config_file = launcher_config_file(&launcher_root);
+            let config = load_launcher_config(&config_file)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Using my mods folder {}",
+                    config.configured_mods_folder(&launcher_root).display()
+                ),
+            )?;
+            let cloned = clone_mod(&launcher_root, &config, &clone_request)?;
+            write_cloned_mod_output(&cloned, stdout)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Finished cloning mod `{}` into `{}`",
+                    cloned.name,
+                    cloned.path.display()
+                ),
+            )
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -597,6 +655,11 @@ pub struct InstallModRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneModRequest {
+    pub git_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedMod {
     pub name: String,
     pub path: PathBuf,
@@ -619,6 +682,13 @@ pub struct InstalledMod {
     pub alias: String,
     pub source: PathBuf,
     pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClonedMod {
+    pub name: String,
+    pub path: PathBuf,
+    pub git_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -785,6 +855,17 @@ fn parse_install_mod_request(mut args: impl Iterator<Item = String>) -> Result<I
     Ok(InstallModRequest { name, alias })
 }
 
+fn parse_clone_mod_request(
+    git_url: String,
+    mut args: impl Iterator<Item = String>,
+) -> Result<CloneModRequest> {
+    if let Some(extra) = args.next() {
+        bail!("unexpected argument for `clone mod`: `{extra}`");
+    }
+    validate_git_url(&git_url)?;
+    Ok(CloneModRequest { git_url })
+}
+
 fn set_version_bump(
     version_bump: &mut VersionBump,
     requested: VersionBump,
@@ -841,6 +922,19 @@ fn set_optional_version(slot: &mut Option<String>, value: String, flag: &str) ->
     }
     validate_version_token(&value, flag)?;
     *slot = Some(value);
+    Ok(())
+}
+
+fn validate_git_url(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("git URL cannot be empty");
+    }
+    if value.trim() != value {
+        bail!("git URL cannot contain leading or trailing whitespace");
+    }
+    if value.chars().any(char::is_whitespace) {
+        bail!("git URL cannot contain whitespace");
+    }
     Ok(())
 }
 
@@ -1672,6 +1766,10 @@ trait ExternalCommands {
     fn open_editor(&mut self, editor: &str, project_dir: &Path) -> Result<bool>;
 }
 
+trait GitCloner {
+    fn clone_repo(&mut self, git_url: &str, destination: &Path) -> Result<()>;
+}
+
 struct ProcessExternalCommands;
 
 impl ExternalCommands for ProcessExternalCommands {
@@ -1708,6 +1806,27 @@ impl ExternalCommands for ProcessExternalCommands {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error).with_context(|| format!("failed to start `{editor}`")),
         }
+    }
+}
+
+struct ProcessGitCloner;
+
+impl GitCloner for ProcessGitCloner {
+    fn clone_repo(&mut self, git_url: &str, destination: &Path) -> Result<()> {
+        let status = Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg(git_url)
+            .arg(destination)
+            .status()
+            .context("failed to start `git clone`")?;
+        if !status.success() {
+            match status.code() {
+                Some(code) => bail!("`git clone` exited with status code {code}"),
+                None => bail!("`git clone` was terminated by signal"),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1844,6 +1963,82 @@ fn install_mod_project_with_services(
         source,
         destination,
     })
+}
+
+pub fn clone_mod_project(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    request: &CloneModRequest,
+) -> Result<ClonedMod> {
+    let mut cloner = ProcessGitCloner;
+    clone_mod_project_with_services(launcher_root, config, request, &mut cloner)
+}
+
+fn clone_mod_project_with_services(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    request: &CloneModRequest,
+    cloner: &mut impl GitCloner,
+) -> Result<ClonedMod> {
+    validate_git_url(&request.git_url)?;
+
+    let mods_folder = config.configured_mods_folder(launcher_root);
+    fs::create_dir_all(&mods_folder)
+        .with_context(|| format!("failed to create `{}`", mods_folder.display()))?;
+    let temp_dir = available_clone_temp_dir(&mods_folder)?;
+
+    let result = (|| -> Result<ClonedMod> {
+        cloner.clone_repo(&request.git_url, &temp_dir)?;
+        let mod_config = load_mod_config_from_dir(&temp_dir)
+            .context("cloned repository does not contain a valid mod.yml")?;
+        let target_dir = mods_folder.join(&mod_config.name);
+        if target_dir
+            .try_exists()
+            .with_context(|| format!("failed to inspect `{}`", target_dir.display()))?
+        {
+            bail!("mod project already exists at `{}`", target_dir.display());
+        }
+
+        fs::rename(&temp_dir, &target_dir).with_context(|| {
+            format!(
+                "failed to move cloned mod from `{}` to `{}`",
+                temp_dir.display(),
+                target_dir.display()
+            )
+        })?;
+
+        Ok(ClonedMod {
+            name: mod_config.name,
+            path: target_dir,
+            git_url: request.git_url.clone(),
+        })
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    result
+}
+
+fn available_clone_temp_dir(mods_folder: &Path) -> Result<PathBuf> {
+    let process_id = std::process::id();
+    for counter in 0..1000_u16 {
+        let candidate = mods_folder.join(format!(".clear-launcher-clone-{process_id}-{counter}"));
+        match candidate.try_exists() {
+            Ok(false) => return Ok(candidate),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect `{}`", candidate.display()));
+            }
+        }
+    }
+
+    bail!(
+        "could not reserve temporary clone folder under `{}`",
+        mods_folder.display()
+    )
 }
 
 fn resolve_mod_project_for_request(
@@ -3473,13 +3668,23 @@ fn write_installed_mod_output(installed: &InstalledMod, stdout: &mut impl Write)
     .context("failed to write install mod output")
 }
 
+fn write_cloned_mod_output(cloned: &ClonedMod, stdout: &mut impl Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "Cloned mod {} at {}",
+        cloned.name,
+        cloned.path.display()
+    )
+    .context("failed to write clone mod output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -3657,6 +3862,7 @@ mod tests {
             |_, _, _| unreachable!("versions command should not create mods"),
             |_, _, _, _| unreachable!("versions command should not build mods"),
             |_, _, _, _, _| unreachable!("versions command should not install mods"),
+            |_, _, _| unreachable!("versions command should not clone mods"),
             || unreachable!("versions command should not inspect the current executable"),
         )
         .unwrap();
@@ -3731,6 +3937,7 @@ mod tests {
             },
             |_, _, _, _| unreachable!("create mod command should not build mods"),
             |_, _, _, _, _| unreachable!("create mod command should not install mods"),
+            |_, _, _| unreachable!("create mod command should not clone mods"),
             || unreachable!("create mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -3802,6 +4009,7 @@ mod tests {
                 })
             },
             |_, _, _, _, _| unreachable!("build mod command should not install mods"),
+            |_, _, _| unreachable!("build mod command should not clone mods"),
             || unreachable!("build mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -3868,6 +4076,7 @@ mod tests {
                     destination: versions_folder.join("1.20.4/survival/mods/cool-blocks-1.0.0.jar"),
                 })
             },
+            |_, _, _| unreachable!("install mod command should not clone mods"),
             || unreachable!("install mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -3884,6 +4093,75 @@ mod tests {
         let logs = String::from_utf8(stderr).unwrap();
         assert!(logs.contains("Preparing install for current mod"));
         assert!(logs.contains("Using install alias `survival`"));
+    }
+
+    #[test]
+    fn clone_mod_command_uses_config_and_git_url() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
+        let mods_folder = repo.path().join("configured-mods");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::write(
+            launcher_root.join(CONFIG_FILE_NAME),
+            format!("mods_folder: {}\n", mods_folder.display()),
+        )
+        .unwrap();
+
+        let env = test_env_for(&home, None);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        execute_with_services(
+            vec![
+                "clone".to_owned(),
+                "mod".to_owned(),
+                "https://example.test/repository-name.git".to_owned(),
+            ],
+            &cwd,
+            &env,
+            &mut stdout,
+            &mut stderr,
+            || unreachable!("clone mod command should not fetch Fabric versions"),
+            |_, _, _| unreachable!("clone mod command should not install versions"),
+            |_, _, _| unreachable!("clone mod command should not run versions"),
+            |_, _, _| unreachable!("clone mod command should not create mods"),
+            |_, _, _, _| unreachable!("clone mod command should not build mods"),
+            |_, _, _, _, _| unreachable!("clone mod command should not install mods"),
+            |root, config, request| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(config.configured_mods_folder(root), mods_folder);
+                assert_eq!(
+                    request,
+                    &CloneModRequest {
+                        git_url: "https://example.test/repository-name.git".to_owned(),
+                    }
+                );
+                Ok(ClonedMod {
+                    name: "mod-yml-name".to_owned(),
+                    path: mods_folder.join("mod-yml-name"),
+                    git_url: request.git_url.clone(),
+                })
+            },
+            || unreachable!("clone mod command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Cloned mod mod-yml-name at {}\n",
+                mods_folder.join("mod-yml-name").display()
+            )
+        );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains(
+            "Preparing clone for mod repository `https://example.test/repository-name.git`"
+        ));
+        assert!(logs.contains("Using my mods folder"));
+        assert!(logs.contains("Finished cloning mod `mod-yml-name`"));
     }
 
     #[test]
@@ -4272,6 +4550,105 @@ mod tests {
     }
 
     #[test]
+    fn clones_mod_project_to_name_from_mod_config() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let mods_folder = launcher_root.join(MODS_FOLDER_NAME);
+        let request = CloneModRequest {
+            git_url: "https://example.test/repository-name.git".to_owned(),
+        };
+        let mut cloner = FakeGitCloner::with_mod_yml("name: mod-yml-name\n");
+
+        let cloned = clone_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &request,
+            &mut cloner,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cloned,
+            ClonedMod {
+                name: "mod-yml-name".to_owned(),
+                path: mods_folder.join("mod-yml-name"),
+                git_url: request.git_url.clone(),
+            }
+        );
+        assert_eq!(cloner.clones.len(), 1);
+        assert_eq!(cloner.clones[0].0, request.git_url);
+        assert_eq!(cloner.clones[0].1.parent(), Some(mods_folder.as_path()));
+        assert!(
+            cloner.clones[0]
+                .1
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".clear-launcher-clone-"))
+        );
+        assert!(
+            mods_folder
+                .join("mod-yml-name")
+                .join(MOD_CONFIG_FILE_NAME)
+                .is_file()
+        );
+        assert!(mods_folder.join("mod-yml-name").join("README.md").is_file());
+        assert!(!mods_folder.join("repository-name").exists());
+        assert_eq!(clone_temp_leftovers(&mods_folder), 0);
+    }
+
+    #[test]
+    fn clone_mod_aborts_when_resolved_target_exists() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let mods_folder = launcher_root.join(MODS_FOLDER_NAME);
+        let existing = mods_folder.join("existing-mod");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("local.txt"), "keep").unwrap();
+        let request = CloneModRequest {
+            git_url: "https://example.test/other-name.git".to_owned(),
+        };
+        let mut cloner = FakeGitCloner::with_mod_yml("name: existing-mod\n");
+
+        let error = clone_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &request,
+            &mut cloner,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(existing.join("local.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(clone_temp_leftovers(&mods_folder), 0);
+    }
+
+    #[test]
+    fn clone_mod_aborts_when_cloned_mod_config_is_missing() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let mods_folder = launcher_root.join(MODS_FOLDER_NAME);
+        let request = CloneModRequest {
+            git_url: "https://example.test/missing-config.git".to_owned(),
+        };
+        let mut cloner = FakeGitCloner::without_mod_yml();
+
+        let error = clone_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &request,
+            &mut cloner,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("valid mod.yml"));
+        assert!(!mods_folder.join("missing-config").exists());
+        assert_eq!(clone_temp_leftovers(&mods_folder), 0);
+    }
+
+    #[test]
     fn resolves_latest_major_and_exact_minecraft_versions() {
         let manifest = parse_minecraft_version_manifest(
             r#"
@@ -4368,6 +4745,7 @@ mod tests {
             |_, _, _| unreachable!("install command should not create mods"),
             |_, _, _, _| unreachable!("install command should not build mods"),
             |_, _, _, _, _| unreachable!("install command should not install mods"),
+            |_, _, _| unreachable!("install command should not clone mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -4423,6 +4801,7 @@ mod tests {
             |_, _, _| unreachable!("install command should not create mods"),
             |_, _, _, _| unreachable!("install command should not build mods"),
             |_, _, _, _, _| unreachable!("install command should not install mods"),
+            |_, _, _| unreachable!("install command should not clone mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -4484,6 +4863,7 @@ mod tests {
             |_, _, _| unreachable!("run command should not create mods"),
             |_, _, _, _| unreachable!("run command should not build mods"),
             |_, _, _, _, _| unreachable!("run command should not install mods"),
+            |_, _, _| unreachable!("run command should not clone mods"),
             || unreachable!("run command should not inspect the current executable"),
         )
         .unwrap();
@@ -4685,6 +5065,7 @@ mod tests {
             |_, _, _| unreachable!("configure-path should not create mods"),
             |_, _, _, _| unreachable!("configure-path should not build mods"),
             |_, _, _, _, _| unreachable!("configure-path should not install mods"),
+            |_, _, _| unreachable!("configure-path should not clone mods"),
             || Ok(exe_path.clone()),
         )
         .unwrap();
@@ -4720,6 +5101,7 @@ mod tests {
             |_, _, _| unreachable!("unset-path should not create mods"),
             |_, _, _, _| unreachable!("unset-path should not build mods"),
             |_, _, _, _, _| unreachable!("unset-path should not install mods"),
+            |_, _, _| unreachable!("unset-path should not clone mods"),
             || unreachable!("unset-path should not inspect the current executable"),
         )
         .unwrap();
@@ -5106,6 +5488,19 @@ mod tests {
             .context("test gradle.properties did not include mod_version")
     }
 
+    fn clone_temp_leftovers(mods_folder: &Path) -> usize {
+        fs::read_dir(mods_folder)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".clear-launcher-clone-"))
+            })
+            .count()
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct FakeExternalCommands {
         git_init_dirs: Vec<PathBuf>,
@@ -5137,6 +5532,52 @@ mod tests {
             } else {
                 Ok(false)
             }
+        }
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct FakeGitCloner {
+        clones: Vec<(String, PathBuf)>,
+        mod_yml: Option<String>,
+    }
+
+    impl FakeGitCloner {
+        fn with_mod_yml(mod_yml: &str) -> Self {
+            Self {
+                clones: Vec::new(),
+                mod_yml: Some(mod_yml.to_owned()),
+            }
+        }
+
+        fn without_mod_yml() -> Self {
+            Self {
+                clones: Vec::new(),
+                mod_yml: None,
+            }
+        }
+    }
+
+    impl GitCloner for FakeGitCloner {
+        fn clone_repo(&mut self, git_url: &str, destination: &Path) -> Result<()> {
+            self.clones
+                .push((git_url.to_owned(), destination.to_path_buf()));
+            fs::create_dir_all(destination)
+                .with_context(|| format!("failed to create `{}`", destination.display()))?;
+            fs::write(destination.join("README.md"), "cloned").with_context(|| {
+                format!(
+                    "failed to write clone fixture at `{}`",
+                    destination.display()
+                )
+            })?;
+            if let Some(mod_yml) = self.mod_yml.as_deref() {
+                fs::write(destination.join(MOD_CONFIG_FILE_NAME), mod_yml).with_context(|| {
+                    format!(
+                        "failed to write clone fixture `{}`",
+                        destination.join(MOD_CONFIG_FILE_NAME).display()
+                    )
+                })?;
+            }
+            Ok(())
         }
     }
 
