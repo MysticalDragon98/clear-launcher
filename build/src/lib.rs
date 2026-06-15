@@ -467,12 +467,21 @@ pub struct ModProjectConfig {
     pub mod_id: String,
     pub minecraft_version: String,
     pub fabric_version: String,
-    pub yarn_mappings: String,
+    pub mappings: ModMappings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yarn_mappings: Option<String>,
     pub loom_version: String,
     pub gradle_version: String,
     pub java_version: u8,
     pub maven_group: String,
     pub main_class: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModMappings {
+    Yarn,
+    Unobfuscated,
 }
 
 fn parse_install_request(
@@ -937,24 +946,31 @@ fn fabric_yarn_versions_for_minecraft_url(minecraft_version: &str) -> String {
     format!("{FABRIC_YARN_VERSIONS_URL}/{minecraft_version}?limit=1")
 }
 
-fn resolve_yarn_version(
+fn resolve_mod_mappings(
     downloader: &mut impl Downloader,
     minecraft_version: &str,
-) -> Result<String> {
+) -> Result<(ModMappings, Option<String>)> {
     let versions_url = fabric_yarn_versions_for_minecraft_url(minecraft_version);
     let versions = downloader.download_string(&versions_url)?;
     let versions: Vec<FabricYarnVersion> =
         serde_json::from_str(&versions).context("failed to parse Fabric Yarn versions response")?;
-    versions
-        .into_iter()
-        .next()
-        .with_context(|| format!("no Yarn mappings found for Minecraft `{minecraft_version}`"))
-        .map(|version| version.version)
+    if let Some(version) = versions.into_iter().next() {
+        return Ok((ModMappings::Yarn, Some(version.version)));
+    }
+    if uses_unobfuscated_minecraft_version(minecraft_version) {
+        return Ok((ModMappings::Unobfuscated, None));
+    }
+
+    bail!("no Yarn mappings found for Minecraft `{minecraft_version}`");
 }
 
 #[derive(Debug, Deserialize)]
 struct FabricYarnVersion {
     version: String,
+}
+
+fn uses_unobfuscated_minecraft_version(version: &str) -> bool {
+    version_major(version) >= 26 || version.ends_with("_unobfuscated")
 }
 
 fn fetch_fabric_loom_version(downloader: &mut impl Downloader) -> Result<String> {
@@ -1028,6 +1044,8 @@ fn create_mod_project_with_services(
     {
         bail!("mod project already exists at `{}`", mod_dir.display());
     }
+    fs::create_dir_all(&mods_folder)
+        .with_context(|| format!("failed to create `{}`", mods_folder.display()))?;
 
     let identity = ModIdentity::from_name(&request.name)?;
     let project_config = resolve_mod_project_config(request, &identity, downloader)?;
@@ -1062,7 +1080,7 @@ fn resolve_mod_project_config(
         &minecraft_version,
         request.fabric_version.as_deref(),
     )?;
-    let yarn_mappings = resolve_yarn_version(downloader, &minecraft_version)?;
+    let (mappings, yarn_mappings) = resolve_mod_mappings(downloader, &minecraft_version)?;
     let loom_version = fetch_fabric_loom_version(downloader)?;
     let gradle_version = fetch_gradle_current_version(downloader)?;
     let java_version = java_release_for_minecraft_version(&minecraft_version);
@@ -1072,6 +1090,7 @@ fn resolve_mod_project_config(
         mod_id: identity.mod_id.clone(),
         minecraft_version,
         fabric_version,
+        mappings,
         yarn_mappings,
         loom_version,
         gradle_version,
@@ -1165,6 +1184,17 @@ rootProject.name = '{}'
 
 fn build_gradle_contents(config: &ModProjectConfig) -> String {
     let java_version = config.java_version;
+    let mappings_dependency = match config.mappings {
+        ModMappings::Yarn => {
+            r#"    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+"#
+        }
+        ModMappings::Unobfuscated => "",
+    };
+    let loader_dependency = match config.mappings {
+        ModMappings::Yarn => "modImplementation",
+        ModMappings::Unobfuscated => "implementation",
+    };
     format!(
         r#"plugins {{
     id 'fabric-loom' version "${{loom_version}}"
@@ -1183,8 +1213,7 @@ repositories {{
 
 dependencies {{
     minecraft "com.mojang:minecraft:${{project.minecraft_version}}"
-    mappings "net.fabricmc:yarn:${{project.yarn_mappings}}:v2"
-    modImplementation "net.fabricmc:fabric-loader:${{project.loader_version}}"
+{}    {} "net.fabricmc:fabric-loader:${{project.loader_version}}"
 }}
 
 processResources {{
@@ -1204,11 +1233,17 @@ java {{
     sourceCompatibility = JavaVersion.VERSION_{java_version}
     targetCompatibility = JavaVersion.VERSION_{java_version}
 }}
-"#
+"#,
+        mappings_dependency, loader_dependency
     )
 }
 
 fn gradle_properties_contents(config: &ModProjectConfig) -> String {
+    let yarn_mappings = config
+        .yarn_mappings
+        .as_ref()
+        .map(|version| format!("yarn_mappings={version}\n"))
+        .unwrap_or_default();
     format!(
         r#"# Gradle
 org.gradle.jvmargs=-Xmx1G
@@ -1217,8 +1252,7 @@ gradle_version={}
 
 # Fabric
 minecraft_version={}
-yarn_mappings={}
-loader_version={}
+{}loader_version={}
 loom_version={}
 
 # Mod
@@ -1228,7 +1262,7 @@ archive_base_name={}
 "#,
         config.gradle_version,
         config.minecraft_version,
-        config.yarn_mappings,
+        yarn_mappings,
         config.fabric_version,
         config.loom_version,
         config.maven_group,
@@ -1367,13 +1401,7 @@ fn java_class_name_from_name(name: &str) -> String {
 }
 
 fn java_release_for_minecraft_version(version: &str) -> u8 {
-    let parts = version
-        .split('-')
-        .next()
-        .unwrap_or(version)
-        .split('.')
-        .map(|part| part.parse::<u16>().ok())
-        .collect::<Vec<_>>();
+    let parts = version_components(version);
     let major = parts.first().and_then(|part| *part).unwrap_or_default();
     let minor = parts.get(1).and_then(|part| *part).unwrap_or_default();
     let patch = parts.get(2).and_then(|part| *part).unwrap_or_default();
@@ -1389,6 +1417,23 @@ fn java_release_for_minecraft_version(version: &str) -> u8 {
     } else {
         21
     }
+}
+
+fn version_major(version: &str) -> u16 {
+    version_components(version)
+        .first()
+        .and_then(|part| *part)
+        .unwrap_or_default()
+}
+
+fn version_components(version: &str) -> Vec<Option<u16>> {
+    version
+        .split('-')
+        .next()
+        .unwrap_or(version)
+        .split('.')
+        .map(|part| part.parse::<u16>().ok())
+        .collect()
 }
 
 trait ExternalCommands {
@@ -3058,7 +3103,11 @@ mod tests {
         assert_eq!(created.config.mod_id, "cool-blocks");
         assert_eq!(created.config.minecraft_version, "1.21.8");
         assert_eq!(created.config.fabric_version, "0.16.14");
-        assert_eq!(created.config.yarn_mappings, "1.21.8+build.1");
+        assert_eq!(created.config.mappings, ModMappings::Yarn);
+        assert_eq!(
+            created.config.yarn_mappings.as_deref(),
+            Some("1.21.8+build.1")
+        );
         assert_eq!(created.config.loom_version, "1.17.11");
         assert_eq!(created.config.gradle_version, "9.5.1");
         assert_eq!(created.config.java_version, 21);
@@ -3081,12 +3130,14 @@ mod tests {
 
         let gradle_properties = fs::read_to_string(project_dir.join("gradle.properties")).unwrap();
         assert!(gradle_properties.contains("minecraft_version=1.21.8"));
+        assert!(gradle_properties.contains("yarn_mappings=1.21.8+build.1"));
         assert!(gradle_properties.contains("loader_version=0.16.14"));
         assert!(gradle_properties.contains("loom_version=1.17.11"));
         assert!(gradle_properties.contains("gradle_version=9.5.1"));
 
         let mod_config = fs::read_to_string(project_dir.join("mod.yml")).unwrap();
         assert!(mod_config.contains("minecraft_version: 1.21.8"));
+        assert!(mod_config.contains("mappings: yarn"));
         assert!(mod_config.contains("fabric_version: 0.16.14"));
 
         let fabric_mod: Value = serde_json::from_str(
@@ -3109,6 +3160,102 @@ mod tests {
                 .and_then(Value::as_str),
             Some(">=0.16.14")
         );
+    }
+
+    #[test]
+    fn creates_unobfuscated_mod_project_without_yarn_mappings() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let request = CreateModRequest {
+            name: "Tesr".to_owned(),
+            minecraft_version: None,
+            fabric_version: None,
+        };
+        let yarn_versions_url = fabric_yarn_versions_for_minecraft_url("26.1.2");
+        let loader_versions_url = fabric_loader_versions_for_minecraft_url("26.1.2");
+        let mut downloader = FakeDownloader::new([
+            (
+                MINECRAFT_VERSION_MANIFEST_URL,
+                r#"
+{
+  "latest": {
+    "release": "26.1.2",
+    "snapshot": "26.2-snapshot"
+  },
+  "versions": [
+    {
+      "id": "26.1.2",
+      "type": "release",
+      "url": "https://example.test/26.1.2.json"
+    }
+  ]
+}
+"#,
+            ),
+            (
+                loader_versions_url.as_str(),
+                r#"
+[
+  {
+    "loader": {
+      "version": "0.19.3",
+      "stable": true
+    }
+  }
+]
+"#,
+            ),
+            (yarn_versions_url.as_str(), "[]"),
+            (
+                FABRIC_LOOM_MAVEN_METADATA_URL,
+                r#"
+<metadata>
+  <versioning>
+    <release>1.17.11</release>
+  </versioning>
+</metadata>
+"#,
+            ),
+            (
+                GRADLE_CURRENT_VERSION_URL,
+                r#"
+{
+  "version": "9.5.1"
+}
+"#,
+            ),
+        ]);
+        let mut commands = FakeExternalCommands::default();
+
+        let created = create_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &request,
+            &mut downloader,
+            &mut commands,
+        )
+        .unwrap();
+
+        let project_dir = launcher_root.join("mods").join("Tesr");
+        assert_eq!(created.path, project_dir);
+        assert_eq!(created.config.minecraft_version, "26.1.2");
+        assert_eq!(created.config.fabric_version, "0.19.3");
+        assert_eq!(created.config.mappings, ModMappings::Unobfuscated);
+        assert_eq!(created.config.yarn_mappings, None);
+        assert_eq!(created.config.java_version, 25);
+        assert!(project_dir.is_dir());
+
+        let build_gradle = fs::read_to_string(project_dir.join("build.gradle")).unwrap();
+        assert!(!build_gradle.contains("net.fabricmc:yarn"));
+        assert!(!build_gradle.contains("mappings "));
+        assert!(build_gradle.contains("implementation \"net.fabricmc:fabric-loader:"));
+
+        let gradle_properties = fs::read_to_string(project_dir.join("gradle.properties")).unwrap();
+        assert!(gradle_properties.contains("minecraft_version=26.1.2"));
+        assert!(!gradle_properties.contains("yarn_mappings="));
+
+        let mod_config = fs::read_to_string(project_dir.join("mod.yml")).unwrap();
+        assert!(mod_config.contains("mappings: unobfuscated"));
     }
 
     #[test]
@@ -3888,7 +4035,8 @@ mod tests {
             mod_id: "cool-blocks".to_owned(),
             minecraft_version: "1.20.4".to_owned(),
             fabric_version: "0.16.14".to_owned(),
-            yarn_mappings: "1.20.4+build.3".to_owned(),
+            mappings: ModMappings::Yarn,
+            yarn_mappings: Some("1.20.4+build.3".to_owned()),
             loom_version: "1.17.11".to_owned(),
             gradle_version: "9.5.1".to_owned(),
             java_version: 17,
