@@ -79,3 +79,4 @@ Alias provide ways to have different setups for the same version
 ## 6. CLI Style
 
 **Verbosity:** The CLI by default logs everything that it's doing
+**Progress Bars:** All actions that can be measured with a progress bar (Quantificable) **MUST** be represented in an animated progress bar in order to let the user know what is the action that is doing and what's the progress on it
