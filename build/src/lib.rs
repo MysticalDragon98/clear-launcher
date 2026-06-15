@@ -3,6 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use serde_yaml::{Mapping, Value as YamlValue};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -17,11 +18,13 @@ pub const DEFAULT_LINUX_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH
 pub const DEFAULT_MACOS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_MACOS");
 pub const DEFAULT_WINDOWS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PATH_WINDOWS");
 pub const CONFIG_FILE_NAME: &str = "config.yml";
+pub const MOD_CONFIG_FILE_NAME: &str = "mod.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const MODS_FOLDER_NAME: &str = "mods";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const DEFAULT_EDITOR: &str = "code";
+pub const DEFAULT_MOD_VERSION: &str = "1.0.0";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 pub const FABRIC_GAME_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/game";
 pub const FABRIC_YARN_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/yarn";
@@ -160,6 +163,12 @@ pub fn execute(
             run_minecraft_version_offline(launcher_root, versions_folder, request)
         },
         |launcher_root, config, request| create_mod_project(launcher_root, config, request),
+        |launcher_root, config, cwd, request| {
+            build_mod_project(launcher_root, config, cwd, request)
+        },
+        |launcher_root, versions_folder, config, cwd, request| {
+            install_mod_project(launcher_root, versions_folder, config, cwd, request)
+        },
         current_exe_path,
     )
 }
@@ -174,6 +183,14 @@ fn execute_with_services(
     install_version: impl FnOnce(&Path, &Path, &InstallRequest) -> Result<InstalledVersion>,
     run_version: impl FnOnce(&Path, &Path, &RunRequest) -> Result<LaunchedVersion>,
     create_mod: impl FnOnce(&Path, &LauncherConfig, &CreateModRequest) -> Result<CreatedMod>,
+    build_mod: impl FnOnce(&Path, &LauncherConfig, &Path, &BuildModRequest) -> Result<BuiltMod>,
+    install_mod: impl FnOnce(
+        &Path,
+        &Path,
+        &LauncherConfig,
+        &Path,
+        &InstallModRequest,
+    ) -> Result<InstalledMod>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<()> {
     let mut args = args.into_iter();
@@ -213,6 +230,61 @@ fn execute_with_services(
                     usage_text(DEFAULT_CLI_NAME)
                 )
             })?;
+            if requested_version == "mod" {
+                let install_request = parse_install_mod_request(args)?;
+
+                match install_request.name.as_deref() {
+                    Some(name) => {
+                        write_log(stderr, format_args!("Preparing install for mod `{name}`"))?
+                    }
+                    None => write_log(stderr, format_args!("Preparing install for current mod"))?,
+                }
+                if let Some(alias) = install_request.alias.as_deref() {
+                    write_log(stderr, format_args!("Using install alias `{alias}`"))?;
+                } else {
+                    write_log(
+                        stderr,
+                        format_args!("Using install alias `{DEFAULT_INSTALL_ALIAS}`"),
+                    )?;
+                }
+                write_log(stderr, format_args!("Using compiled launcher settings"))?;
+                let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+                write_log(
+                    stderr,
+                    format_args!("Ensuring launcher path {}", launcher_root.display()),
+                )?;
+                ensure_launcher_root(&launcher_root)?;
+                let config_file = launcher_config_file(&launcher_root);
+                let config = load_launcher_config(&config_file)?;
+                let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+                write_log(
+                    stderr,
+                    format_args!("Using versions folder {}", versions_folder.display()),
+                )?;
+                write_log(
+                    stderr,
+                    format_args!(
+                        "Using my mods folder {}",
+                        config.configured_mods_folder(&launcher_root).display()
+                    ),
+                )?;
+                let installed = install_mod(
+                    &launcher_root,
+                    &versions_folder,
+                    &config,
+                    cwd,
+                    &install_request,
+                )?;
+                write_installed_mod_output(&installed, stdout)?;
+                return write_log(
+                    stderr,
+                    format_args!(
+                        "Finished installing mod `{}` into `{}`",
+                        installed.name,
+                        installed.destination.display()
+                    ),
+                );
+            }
             let install_request = parse_install_request(requested_version, args)?;
 
             write_log(
@@ -373,6 +445,58 @@ fn execute_with_services(
                 format_args!("Finished creating mod project `{}`", created.name),
             )
         }
+        Some("build") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `build`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown build target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let build_request = parse_build_mod_request(args)?;
+
+            match build_request.name.as_deref() {
+                Some(name) => write_log(stderr, format_args!("Preparing build for mod `{name}`"))?,
+                None => write_log(stderr, format_args!("Preparing build for current mod"))?,
+            }
+            match build_request.version_bump {
+                VersionBump::None => {}
+                VersionBump::Minor => write_log(stderr, format_args!("Bumping mod minor version"))?,
+                VersionBump::Major => write_log(stderr, format_args!("Bumping mod major version"))?,
+            }
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
+            ensure_launcher_root(&launcher_root)?;
+            let config_file = launcher_config_file(&launcher_root);
+            let config = load_launcher_config(&config_file)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Using my mods folder {}",
+                    config.configured_mods_folder(&launcher_root).display()
+                ),
+            )?;
+            let built = build_mod(&launcher_root, &config, cwd, &build_request)?;
+            write_built_mod_output(&built, stdout)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Finished building mod `{}` at `{}`",
+                    built.name,
+                    built.jar.display()
+                ),
+            )
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -454,6 +578,25 @@ pub struct CreateModRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildModRequest {
+    pub name: Option<String>,
+    pub version_bump: VersionBump,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionBump {
+    None,
+    Minor,
+    Major,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallModRequest {
+    pub name: Option<String>,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedMod {
     pub name: String,
     pub path: PathBuf,
@@ -461,9 +604,29 @@ pub struct CreatedMod {
     pub editor_opened: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltMod {
+    pub name: String,
+    pub path: PathBuf,
+    pub version: String,
+    pub jar: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledMod {
+    pub name: String,
+    pub minecraft_version: String,
+    pub alias: String,
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ModProjectConfig {
     pub name: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<PathBuf>,
     pub mod_id: String,
     pub minecraft_version: String,
     pub fabric_version: String,
@@ -579,6 +742,71 @@ fn parse_create_mod_request(
         minecraft_version,
         fabric_version,
     })
+}
+
+fn parse_build_mod_request(mut args: impl Iterator<Item = String>) -> Result<BuildModRequest> {
+    let mut name = None;
+    let mut version_bump = VersionBump::None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--minor" {
+            set_version_bump(&mut version_bump, VersionBump::Minor, "--minor")?;
+        } else if arg == "--major" {
+            set_version_bump(&mut version_bump, VersionBump::Major, "--major")?;
+        } else if arg.starts_with("--") {
+            bail!("unexpected argument for `build mod`: `{arg}`");
+        } else {
+            set_optional_mod_name(&mut name, arg, "build mod")?;
+        }
+    }
+
+    Ok(BuildModRequest { name, version_bump })
+}
+
+fn parse_install_mod_request(mut args: impl Iterator<Item = String>) -> Result<InstallModRequest> {
+    let mut name = None;
+    let mut alias = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--alias" {
+            let value = args
+                .next()
+                .context("missing value for `--alias` in `install mod`")?;
+            set_install_alias(&mut alias, value)?;
+        } else if let Some(value) = arg.strip_prefix("--alias=") {
+            set_install_alias(&mut alias, value.to_owned())?;
+        } else if arg.starts_with("--") {
+            bail!("unexpected argument for `install mod`: `{arg}`");
+        } else {
+            set_optional_mod_name(&mut name, arg, "install mod")?;
+        }
+    }
+
+    Ok(InstallModRequest { name, alias })
+}
+
+fn set_version_bump(
+    version_bump: &mut VersionBump,
+    requested: VersionBump,
+    flag: &str,
+) -> Result<()> {
+    if *version_bump != VersionBump::None {
+        bail!("only one of `--minor` or `--major` can be provided");
+    }
+    *version_bump = requested;
+    if requested == VersionBump::None {
+        bail!("invalid version bump flag `{flag}`");
+    }
+    Ok(())
+}
+
+fn set_optional_mod_name(slot: &mut Option<String>, value: String, command: &str) -> Result<()> {
+    if slot.is_some() {
+        bail!("mod name was provided more than once for `{command}`");
+    }
+    validate_path_segment(&value, "mod name")?;
+    *slot = Some(value);
+    Ok(())
 }
 
 fn set_install_alias(alias: &mut Option<String>, value: String) -> Result<()> {
@@ -1087,6 +1315,8 @@ fn resolve_mod_project_config(
 
     Ok(ModProjectConfig {
         name: request.name.clone(),
+        version: DEFAULT_MOD_VERSION.to_owned(),
+        build: None,
         mod_id: identity.mod_id.clone(),
         minecraft_version,
         fabric_version,
@@ -1256,7 +1486,7 @@ minecraft_version={}
 loom_version={}
 
 # Mod
-mod_version=1.0.0
+mod_version={}
 maven_group={}
 archive_base_name={}
 "#,
@@ -1265,6 +1495,7 @@ archive_base_name={}
         yarn_mappings,
         config.fabric_version,
         config.loom_version,
+        config.version,
         config.maven_group,
         config.mod_id
     )
@@ -1478,6 +1709,491 @@ impl ExternalCommands for ProcessExternalCommands {
             Err(error) => Err(error).with_context(|| format!("failed to start `{editor}`")),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedModConfig {
+    name: String,
+    mod_id: Option<String>,
+    minecraft_version: Option<String>,
+    version: Option<String>,
+    build: Option<PathBuf>,
+    document: YamlValue,
+}
+
+pub fn build_mod_project(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    request: &BuildModRequest,
+) -> Result<BuiltMod> {
+    let mut builder = ProcessModBuilder;
+    build_mod_project_with_services(launcher_root, config, cwd, request, &mut builder)
+}
+
+fn build_mod_project_with_services(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    request: &BuildModRequest,
+    builder: &mut impl ModBuilder,
+) -> Result<BuiltMod> {
+    let (mod_dir, mut mod_config) =
+        resolve_mod_project_for_request(launcher_root, config, cwd, request.name.as_deref())?;
+    let version = next_mod_version(mod_config.version.as_deref(), request.version_bump)?;
+
+    write_gradle_mod_version(&mod_dir, &version)?;
+    builder.build(&mod_dir)?;
+    let jar = find_mod_build_jar(&mod_dir, &version)?;
+    update_loaded_mod_config_build(&mut mod_config, &mod_dir, &version, &jar)?;
+
+    Ok(BuiltMod {
+        name: mod_config.name,
+        path: mod_dir,
+        version,
+        jar,
+    })
+}
+
+pub fn install_mod_project(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    request: &InstallModRequest,
+) -> Result<InstalledMod> {
+    let mut builder = ProcessModBuilder;
+    install_mod_project_with_services(
+        launcher_root,
+        versions_folder,
+        config,
+        cwd,
+        request,
+        &mut builder,
+    )
+}
+
+fn install_mod_project_with_services(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    request: &InstallModRequest,
+    builder: &mut impl ModBuilder,
+) -> Result<InstalledMod> {
+    let (mod_dir, mod_config) =
+        resolve_mod_project_for_request(launcher_root, config, cwd, request.name.as_deref())?;
+    let minecraft_version = mod_config
+        .minecraft_version
+        .as_deref()
+        .context("mod config `minecraft_version` is required to install a mod")?;
+    validate_version_token(minecraft_version, "mod config `minecraft_version`")?;
+    let alias = request.alias.as_deref().unwrap_or(DEFAULT_INSTALL_ALIAS);
+    validate_path_segment(alias, "install alias")?;
+
+    let version_dir = versions_folder.join(minecraft_version).join(alias);
+    if !version_dir
+        .try_exists()
+        .with_context(|| format!("failed to inspect `{}`", version_dir.display()))?
+    {
+        bail!(
+            "Minecraft version `{minecraft_version}` with alias `{alias}` is not installed at `{}`",
+            version_dir.display()
+        );
+    }
+
+    let source = match existing_mod_build_jar(&mod_dir, &mod_config)? {
+        Some(jar) => jar,
+        None => {
+            let built = build_mod_project_with_services(
+                launcher_root,
+                config,
+                cwd,
+                &BuildModRequest {
+                    name: request.name.clone(),
+                    version_bump: VersionBump::None,
+                },
+                builder,
+            )?;
+            built.jar
+        }
+    };
+
+    let mods_dir = ensure_version_mods_dir(&version_dir)?;
+    let file_name = source
+        .file_name()
+        .context("built mod jar path does not include a file name")?;
+    let destination = mods_dir.join(file_name);
+    let mod_id = match mod_config.mod_id.as_deref() {
+        Some(mod_id) => mod_id.to_owned(),
+        None => mod_id_from_name(&mod_config.name)?,
+    };
+    remove_previous_installed_mod_jars(&mods_dir, &mod_id, &destination)?;
+    fs::copy(&source, &destination).with_context(|| {
+        format!(
+            "failed to copy `{}` to `{}`",
+            source.display(),
+            destination.display()
+        )
+    })?;
+
+    Ok(InstalledMod {
+        name: mod_config.name,
+        minecraft_version: minecraft_version.to_owned(),
+        alias: alias.to_owned(),
+        source,
+        destination,
+    })
+}
+
+fn resolve_mod_project_for_request(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    name: Option<&str>,
+) -> Result<(PathBuf, LoadedModConfig)> {
+    match name {
+        Some(name) => {
+            validate_path_segment(name, "mod name")?;
+            let mod_dir = config.configured_mods_folder(launcher_root).join(name);
+            let mod_config = load_mod_config_from_dir(&mod_dir)?;
+            if mod_config.name != name {
+                bail!(
+                    "requested mod `{name}` does not match mod config name `{}`",
+                    mod_config.name
+                );
+            }
+            Ok((mod_dir, mod_config))
+        }
+        None => {
+            let mod_config = load_mod_config_from_dir(cwd)?;
+            Ok((cwd.to_path_buf(), mod_config))
+        }
+    }
+}
+
+fn load_mod_config_from_dir(mod_dir: &Path) -> Result<LoadedModConfig> {
+    let config_file = mod_dir.join(MOD_CONFIG_FILE_NAME);
+    if !config_file.is_file() {
+        bail!("mod config file not found at `{}`", config_file.display());
+    }
+    let contents = fs::read_to_string(&config_file)
+        .with_context(|| format!("failed to read `{}`", config_file.display()))?;
+    if contents.trim().is_empty() {
+        bail!("mod config file `{}` is empty", config_file.display());
+    }
+
+    let document: YamlValue = serde_yaml::from_str(&contents)
+        .with_context(|| format!("failed to parse `{}`", config_file.display()))?;
+    let (name, mod_id, minecraft_version, version, build) = {
+        let mapping = document
+            .as_mapping()
+            .with_context(|| format!("`{}` must contain a YAML mapping", config_file.display()))?;
+        let name = required_yaml_string(mapping, "name", "mod config `name`")?.to_owned();
+        let mod_id = optional_yaml_string(mapping, "mod_id", "mod config `mod_id`")?;
+        let minecraft_version = optional_yaml_string(
+            mapping,
+            "minecraft_version",
+            "mod config `minecraft_version`",
+        )?;
+        let version = optional_yaml_string(mapping, "version", "mod config `version`")?;
+        let build =
+            optional_yaml_string(mapping, "build", "mod config `build`")?.map(PathBuf::from);
+        (name, mod_id, minecraft_version, version, build)
+    };
+
+    validate_path_segment(&name, "mod name")?;
+    if let Some(mod_id) = mod_id.as_deref() {
+        validate_path_segment(mod_id, "mod id")?;
+    }
+    if let Some(minecraft_version) = minecraft_version.as_deref() {
+        validate_version_token(minecraft_version, "mod config `minecraft_version`")?;
+    }
+    if let Some(version) = version.as_deref() {
+        validate_version_token(version, "mod config `version`")?;
+    }
+    if let Some(build) = build.as_ref() {
+        if build.as_os_str().is_empty() {
+            bail!("mod config `build` cannot be empty");
+        }
+    }
+
+    Ok(LoadedModConfig {
+        name,
+        mod_id,
+        minecraft_version,
+        version,
+        build,
+        document,
+    })
+}
+
+fn required_yaml_string(mapping: &Mapping, key: &str, label: &str) -> Result<String> {
+    optional_yaml_string(mapping, key, label)?.with_context(|| format!("{label} is required"))
+}
+
+fn optional_yaml_string(mapping: &Mapping, key: &str, label: &str) -> Result<Option<String>> {
+    let key = YamlValue::String(key.to_owned());
+    let Some(value) = mapping.get(&key) else {
+        return Ok(None);
+    };
+    match value {
+        YamlValue::Null => Ok(None),
+        YamlValue::String(value) => {
+            if value.trim().is_empty() {
+                bail!("{label} cannot be empty");
+            }
+            if value.trim() != value {
+                bail!("{label} cannot contain leading or trailing whitespace");
+            }
+            Ok(Some(value.clone()))
+        }
+        _ => bail!("{label} must be a string"),
+    }
+}
+
+fn update_loaded_mod_config_build(
+    mod_config: &mut LoadedModConfig,
+    mod_dir: &Path,
+    version: &str,
+    jar: &Path,
+) -> Result<()> {
+    let config_file = mod_dir.join(MOD_CONFIG_FILE_NAME);
+    let relative_jar = jar
+        .strip_prefix(mod_dir)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| jar.to_path_buf());
+    let mapping = mod_config
+        .document
+        .as_mapping_mut()
+        .with_context(|| format!("`{}` must contain a YAML mapping", config_file.display()))?;
+    set_yaml_string(mapping, "version", version);
+    set_yaml_string(mapping, "build", &path_to_string(&relative_jar));
+
+    let contents =
+        serde_yaml::to_string(&mod_config.document).context("failed to serialize mod config")?;
+    fs::write(&config_file, contents)
+        .with_context(|| format!("failed to write `{}`", config_file.display()))?;
+    mod_config.version = Some(version.to_owned());
+    mod_config.build = Some(relative_jar);
+    Ok(())
+}
+
+fn set_yaml_string(mapping: &mut Mapping, key: &str, value: &str) {
+    mapping.insert(
+        YamlValue::String(key.to_owned()),
+        YamlValue::String(value.to_owned()),
+    );
+}
+
+fn next_mod_version(current: Option<&str>, bump: VersionBump) -> Result<String> {
+    let current = current.unwrap_or(DEFAULT_MOD_VERSION);
+    validate_version_token(current, "mod config `version`")?;
+    match bump {
+        VersionBump::None => Ok(current.to_owned()),
+        VersionBump::Minor => {
+            let (major, minor, _) = parse_mod_semver(current)?;
+            Ok(format!("{major}.{}.0", minor + 1))
+        }
+        VersionBump::Major => {
+            let (major, _, _) = parse_mod_semver(current)?;
+            Ok(format!("{}.0.0", major + 1))
+        }
+    }
+}
+
+fn parse_mod_semver(version: &str) -> Result<(u64, u64, u64)> {
+    let parts = version.split('.').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 3 {
+        bail!("mod version `{version}` must use major.minor.patch numeric format");
+    }
+
+    let mut parsed = [0_u64; 3];
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() || !part.chars().all(|character| character.is_ascii_digit()) {
+            bail!("mod version `{version}` must use major.minor.patch numeric format");
+        }
+        parsed[index] = part
+            .parse::<u64>()
+            .with_context(|| format!("failed to parse mod version `{version}`"))?;
+    }
+
+    Ok((parsed[0], parsed[1], parsed[2]))
+}
+
+fn write_gradle_mod_version(mod_dir: &Path, version: &str) -> Result<()> {
+    let properties_file = mod_dir.join("gradle.properties");
+    let contents = match fs::read_to_string(&properties_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read `{}`", properties_file.display()));
+        }
+    };
+
+    let mut found = false;
+    let mut updated = String::new();
+    for line in contents.lines() {
+        if line.starts_with("mod_version=") {
+            found = true;
+            updated.push_str(&format!("mod_version={version}\n"));
+        } else {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+    if !found {
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&format!("mod_version={version}\n"));
+    }
+
+    fs::write(&properties_file, updated)
+        .with_context(|| format!("failed to write `{}`", properties_file.display()))
+}
+
+trait ModBuilder {
+    fn build(&mut self, mod_dir: &Path) -> Result<()>;
+}
+
+struct ProcessModBuilder;
+
+impl ModBuilder for ProcessModBuilder {
+    fn build(&mut self, mod_dir: &Path) -> Result<()> {
+        let (program, args) = gradle_build_command(mod_dir);
+        let status = Command::new(&program)
+            .args(&args)
+            .current_dir(mod_dir)
+            .status()
+            .with_context(|| format!("failed to start `{program}`"))?;
+        if !status.success() {
+            match status.code() {
+                Some(code) => bail!("`{}` exited with status code {code}", program),
+                None => bail!("`{}` was terminated by signal", program),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn gradle_build_command(mod_dir: &Path) -> (String, Vec<String>) {
+    let unix_wrapper = mod_dir.join("gradlew");
+    if unix_wrapper.is_file() {
+        return (path_to_string(&unix_wrapper), vec!["build".to_owned()]);
+    }
+
+    let windows_wrapper = mod_dir.join("gradlew.bat");
+    if windows_wrapper.is_file() {
+        return (path_to_string(&windows_wrapper), vec!["build".to_owned()]);
+    }
+
+    ("gradle".to_owned(), vec!["build".to_owned()])
+}
+
+fn existing_mod_build_jar(mod_dir: &Path, mod_config: &LoadedModConfig) -> Result<Option<PathBuf>> {
+    let Some(build_path) = mod_config.build.as_ref() else {
+        return Ok(None);
+    };
+    let build_path = if build_path.is_absolute() {
+        build_path.clone()
+    } else {
+        mod_dir.join(build_path)
+    };
+    if !build_path.is_file() {
+        return Ok(None);
+    }
+    if !path_has_extension(&build_path, "jar") {
+        bail!(
+            "mod config `build` does not point to a jar file: `{}`",
+            build_path.display()
+        );
+    }
+    Ok(Some(build_path))
+}
+
+fn find_mod_build_jar(mod_dir: &Path, version: &str) -> Result<PathBuf> {
+    let libs_dir = mod_dir.join(BUILD_FOLDER_NAME).join("libs");
+    if !libs_dir.is_dir() {
+        bail!(
+            "Gradle build output folder not found at `{}`",
+            libs_dir.display()
+        );
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&libs_dir)
+        .with_context(|| format!("failed to read `{}`", libs_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", libs_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || !path_has_extension(&path, "jar") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.contains("-sources") || name.contains("-javadoc") {
+            continue;
+        }
+        candidates.push(path);
+    }
+
+    candidates.sort();
+    if let Some(path) = candidates.iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(version))
+    }) {
+        return Ok(path.clone());
+    }
+    candidates.into_iter().next().with_context(|| {
+        format!(
+            "Gradle build did not produce a mod jar under `{}`",
+            libs_dir.display()
+        )
+    })
+}
+
+fn remove_previous_installed_mod_jars(
+    mods_dir: &Path,
+    mod_id: &str,
+    destination: &Path,
+) -> Result<()> {
+    for entry in fs::read_dir(mods_dir)
+        .with_context(|| format!("failed to read `{}`", mods_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", mods_dir.display()))?;
+        let path = entry.path();
+        if path == destination || !path.is_file() || !path_has_extension(&path, "jar") {
+            continue;
+        }
+        if installed_jar_matches_mod_id(&path, mod_id) {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove `{}`", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn installed_jar_matches_mod_id(path: &Path, mod_id: &str) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            stem == mod_id
+                || stem
+                    .strip_prefix(mod_id)
+                    .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+        })
+}
+
+fn path_has_extension(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2734,13 +3450,36 @@ fn write_created_mod_output(created: &CreatedMod, stdout: &mut impl Write) -> Re
     .context("failed to write create mod output")
 }
 
+fn write_built_mod_output(built: &BuiltMod, stdout: &mut impl Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "Built mod {} {} at {}",
+        built.name,
+        built.version,
+        built.jar.display()
+    )
+    .context("failed to write build mod output")
+}
+
+fn write_installed_mod_output(installed: &InstalledMod, stdout: &mut impl Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "Installed mod {} to Minecraft {} as {} at {}",
+        installed.name,
+        installed.minecraft_version,
+        installed.alias,
+        installed.destination.display()
+    )
+    .context("failed to write install mod output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -2916,6 +3655,8 @@ mod tests {
             |_, _, _| unreachable!("versions command should not install versions"),
             |_, _, _| unreachable!("versions command should not run versions"),
             |_, _, _| unreachable!("versions command should not create mods"),
+            |_, _, _, _| unreachable!("versions command should not build mods"),
+            |_, _, _, _, _| unreachable!("versions command should not install mods"),
             || unreachable!("versions command should not inspect the current executable"),
         )
         .unwrap();
@@ -2988,6 +3729,8 @@ mod tests {
                     editor_opened: true,
                 })
             },
+            |_, _, _, _| unreachable!("create mod command should not build mods"),
+            |_, _, _, _, _| unreachable!("create mod command should not install mods"),
             || unreachable!("create mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -3004,6 +3747,143 @@ mod tests {
         assert!(logs.contains("Using requested Minecraft version `1.20.4`"));
         assert!(logs.contains("Using requested Fabric loader `0.16.14`"));
         assert!(logs.contains("Opened mod project with `test-editor`"));
+    }
+
+    #[test]
+    fn build_mod_command_uses_config_and_options() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
+        let mods_folder = repo.path().join("configured-mods");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::write(
+            launcher_root.join(CONFIG_FILE_NAME),
+            format!("mods_folder: {}\n", mods_folder.display()),
+        )
+        .unwrap();
+
+        let env = test_env_for(&home, None);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        execute_with_services(
+            vec![
+                "build".to_owned(),
+                "mod".to_owned(),
+                "Cool Blocks".to_owned(),
+                "--minor".to_owned(),
+            ],
+            &cwd,
+            &env,
+            &mut stdout,
+            &mut stderr,
+            || unreachable!("build mod command should not fetch Fabric versions"),
+            |_, _, _| unreachable!("build mod command should not install versions"),
+            |_, _, _| unreachable!("build mod command should not run versions"),
+            |_, _, _| unreachable!("build mod command should not create mods"),
+            |root, config, current_dir, request| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(current_dir, cwd.as_path());
+                assert_eq!(config.configured_mods_folder(root), mods_folder);
+                assert_eq!(
+                    request,
+                    &BuildModRequest {
+                        name: Some("Cool Blocks".to_owned()),
+                        version_bump: VersionBump::Minor,
+                    }
+                );
+                Ok(BuiltMod {
+                    name: "Cool Blocks".to_owned(),
+                    path: mods_folder.join("Cool Blocks"),
+                    version: "1.1.0".to_owned(),
+                    jar: mods_folder.join("Cool Blocks/build/libs/cool-blocks-1.1.0.jar"),
+                })
+            },
+            |_, _, _, _, _| unreachable!("build mod command should not install mods"),
+            || unreachable!("build mod command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Built mod Cool Blocks 1.1.0 at {}\n",
+                mods_folder
+                    .join("Cool Blocks/build/libs/cool-blocks-1.1.0.jar")
+                    .display()
+            )
+        );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Preparing build for mod `Cool Blocks`"));
+        assert!(logs.contains("Bumping mod minor version"));
+    }
+
+    #[test]
+    fn install_mod_command_uses_current_mod_and_alias() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("mods").join("cool-blocks");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        fs::create_dir_all(&cwd).unwrap();
+
+        let env = test_env_for(&home, None);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        execute_with_services(
+            vec![
+                "install".to_owned(),
+                "mod".to_owned(),
+                "--alias".to_owned(),
+                "survival".to_owned(),
+            ],
+            &cwd,
+            &env,
+            &mut stdout,
+            &mut stderr,
+            || unreachable!("install mod command should not fetch Fabric versions"),
+            |_, _, _| unreachable!("install mod command should not install versions"),
+            |_, _, _| unreachable!("install mod command should not run versions"),
+            |_, _, _| unreachable!("install mod command should not create mods"),
+            |_, _, _, _| unreachable!("install mod command should not build mods directly"),
+            |root, versions, _config, current_dir, request| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(versions, versions_folder.as_path());
+                assert_eq!(current_dir, cwd.as_path());
+                assert_eq!(
+                    request,
+                    &InstallModRequest {
+                        name: None,
+                        alias: Some("survival".to_owned()),
+                    }
+                );
+                Ok(InstalledMod {
+                    name: "cool-blocks".to_owned(),
+                    minecraft_version: "1.20.4".to_owned(),
+                    alias: "survival".to_owned(),
+                    source: cwd.join("build/libs/cool-blocks-1.0.0.jar"),
+                    destination: versions_folder.join("1.20.4/survival/mods/cool-blocks-1.0.0.jar"),
+                })
+            },
+            || unreachable!("install mod command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Installed mod cool-blocks to Minecraft 1.20.4 as survival at {}\n",
+                versions_folder
+                    .join("1.20.4/survival/mods/cool-blocks-1.0.0.jar")
+                    .display()
+            )
+        );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Preparing install for current mod"));
+        assert!(logs.contains("Using install alias `survival`"));
     }
 
     #[test]
@@ -3137,6 +4017,7 @@ mod tests {
 
         let mod_config = fs::read_to_string(project_dir.join("mod.yml")).unwrap();
         assert!(mod_config.contains("minecraft_version: 1.21.8"));
+        assert!(mod_config.contains("version: 1.0.0"));
         assert!(mod_config.contains("mappings: yarn"));
         assert!(mod_config.contains("fabric_version: 0.16.14"));
 
@@ -3259,6 +4140,138 @@ mod tests {
     }
 
     #[test]
+    fn builds_mod_updates_version_build_path_and_gradle_properties() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let mod_dir = launcher_root.join("mods").join("cool-blocks");
+        fs::create_dir_all(&mod_dir).unwrap();
+        fs::write(
+            mod_dir.join(MOD_CONFIG_FILE_NAME),
+            "name: cool-blocks\nmod_id: cool-blocks\nminecraft_version: 1.20.4\nversion: 1.2.3\n",
+        )
+        .unwrap();
+        fs::write(
+            mod_dir.join("gradle.properties"),
+            "minecraft_version=1.20.4\nmod_version=1.2.3\narchive_base_name=cool-blocks\n",
+        )
+        .unwrap();
+
+        let mut builder = FakeModBuilder::default();
+        let built = build_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            repo.path(),
+            &BuildModRequest {
+                name: Some("cool-blocks".to_owned()),
+                version_bump: VersionBump::Minor,
+            },
+            &mut builder,
+        )
+        .unwrap();
+
+        assert_eq!(built.name, "cool-blocks");
+        assert_eq!(built.version, "1.3.0");
+        assert_eq!(builder.build_dirs, vec![mod_dir.clone()]);
+        assert_eq!(fs::read(&built.jar).unwrap(), b"fake jar");
+
+        let gradle_properties = fs::read_to_string(mod_dir.join("gradle.properties")).unwrap();
+        assert!(gradle_properties.contains("mod_version=1.3.0"));
+        assert!(!gradle_properties.contains("mod_version=1.2.3"));
+
+        let mod_config = fs::read_to_string(mod_dir.join(MOD_CONFIG_FILE_NAME)).unwrap();
+        assert!(mod_config.contains("version: 1.3.0"));
+        assert!(mod_config.contains("build: build/libs/cool-blocks-1.3.0.jar"));
+    }
+
+    #[test]
+    fn builds_current_mod_defaults_missing_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let mod_dir = repo.path().join("standalone-mod");
+        fs::create_dir_all(&mod_dir).unwrap();
+        fs::write(
+            mod_dir.join(MOD_CONFIG_FILE_NAME),
+            "name: local-mod\nmod_id: local-mod\nminecraft_version: 1.20.4\n",
+        )
+        .unwrap();
+        fs::write(
+            mod_dir.join("gradle.properties"),
+            "minecraft_version=1.20.4\narchive_base_name=local-mod\n",
+        )
+        .unwrap();
+
+        let mut builder = FakeModBuilder::default();
+        let built = build_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &mod_dir,
+            &BuildModRequest {
+                name: None,
+                version_bump: VersionBump::None,
+            },
+            &mut builder,
+        )
+        .unwrap();
+
+        assert_eq!(built.path, mod_dir);
+        assert_eq!(built.version, DEFAULT_MOD_VERSION);
+        assert_eq!(builder.build_dirs, vec![built.path.clone()]);
+        let mod_config = fs::read_to_string(built.path.join(MOD_CONFIG_FILE_NAME)).unwrap();
+        assert!(mod_config.contains("version: 1.0.0"));
+        assert!(mod_config.contains("build: build/libs/local-mod-1.0.0.jar"));
+    }
+
+    #[test]
+    fn installs_mod_building_missing_jar_and_replacing_old_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        let version_dir = versions_folder.join("1.20.4").join("survival");
+        let installed_mods_dir = version_dir.join(MODS_FOLDER_NAME);
+        let mod_dir = launcher_root.join(MODS_FOLDER_NAME).join("cool-blocks");
+        fs::create_dir_all(&installed_mods_dir).unwrap();
+        fs::create_dir_all(&mod_dir).unwrap();
+        fs::write(installed_mods_dir.join("cool-blocks-1.1.0.jar"), "old").unwrap();
+        fs::write(installed_mods_dir.join("other-mod-1.0.0.jar"), "other").unwrap();
+        fs::write(
+            mod_dir.join(MOD_CONFIG_FILE_NAME),
+            "name: cool-blocks\nmod_id: cool-blocks\nminecraft_version: 1.20.4\nversion: 1.2.0\n",
+        )
+        .unwrap();
+        fs::write(
+            mod_dir.join("gradle.properties"),
+            "minecraft_version=1.20.4\nmod_version=1.2.0\narchive_base_name=cool-blocks\n",
+        )
+        .unwrap();
+
+        let mut builder = FakeModBuilder::default();
+        let installed = install_mod_project_with_services(
+            &launcher_root,
+            &versions_folder,
+            &LauncherConfig::default(),
+            repo.path(),
+            &InstallModRequest {
+                name: Some("cool-blocks".to_owned()),
+                alias: Some("survival".to_owned()),
+            },
+            &mut builder,
+        )
+        .unwrap();
+
+        assert_eq!(installed.name, "cool-blocks");
+        assert_eq!(installed.minecraft_version, "1.20.4");
+        assert_eq!(installed.alias, "survival");
+        assert_eq!(
+            installed.destination,
+            installed_mods_dir.join("cool-blocks-1.2.0.jar")
+        );
+        assert_eq!(fs::read(&installed.destination).unwrap(), b"fake jar");
+        assert!(!installed_mods_dir.join("cool-blocks-1.1.0.jar").exists());
+        assert!(installed_mods_dir.join("other-mod-1.0.0.jar").exists());
+        assert_eq!(builder.build_dirs, vec![mod_dir]);
+    }
+
+    #[test]
     fn resolves_latest_major_and_exact_minecraft_versions() {
         let manifest = parse_minecraft_version_manifest(
             r#"
@@ -3353,6 +4366,8 @@ mod tests {
             },
             |_, _, _| unreachable!("install command should not run versions"),
             |_, _, _| unreachable!("install command should not create mods"),
+            |_, _, _, _| unreachable!("install command should not build mods"),
+            |_, _, _, _, _| unreachable!("install command should not install mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -3406,6 +4421,8 @@ mod tests {
             },
             |_, _, _| unreachable!("install command should not run versions"),
             |_, _, _| unreachable!("install command should not create mods"),
+            |_, _, _, _| unreachable!("install command should not build mods"),
+            |_, _, _, _, _| unreachable!("install command should not install mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -3465,6 +4482,8 @@ mod tests {
                 })
             },
             |_, _, _| unreachable!("run command should not create mods"),
+            |_, _, _, _| unreachable!("run command should not build mods"),
+            |_, _, _, _, _| unreachable!("run command should not install mods"),
             || unreachable!("run command should not inspect the current executable"),
         )
         .unwrap();
@@ -3664,6 +4683,8 @@ mod tests {
             |_, _, _| unreachable!("configure-path should not install versions"),
             |_, _, _| unreachable!("configure-path should not run versions"),
             |_, _, _| unreachable!("configure-path should not create mods"),
+            |_, _, _, _| unreachable!("configure-path should not build mods"),
+            |_, _, _, _, _| unreachable!("configure-path should not install mods"),
             || Ok(exe_path.clone()),
         )
         .unwrap();
@@ -3697,6 +4718,8 @@ mod tests {
             |_, _, _| unreachable!("unset-path should not install versions"),
             |_, _, _| unreachable!("unset-path should not run versions"),
             |_, _, _| unreachable!("unset-path should not create mods"),
+            |_, _, _, _| unreachable!("unset-path should not build mods"),
+            |_, _, _, _, _| unreachable!("unset-path should not install mods"),
             || unreachable!("unset-path should not inspect the current executable"),
         )
         .unwrap();
@@ -4032,6 +5055,8 @@ mod tests {
     fn sample_mod_project_config() -> ModProjectConfig {
         ModProjectConfig {
             name: "Cool Blocks".to_owned(),
+            version: DEFAULT_MOD_VERSION.to_owned(),
+            build: None,
             mod_id: "cool-blocks".to_owned(),
             minecraft_version: "1.20.4".to_owned(),
             fabric_version: "0.16.14".to_owned(),
@@ -4047,6 +5072,38 @@ mod tests {
 
     struct FakeDownloader {
         strings: HashMap<String, String>,
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct FakeModBuilder {
+        build_dirs: Vec<PathBuf>,
+    }
+
+    impl ModBuilder for FakeModBuilder {
+        fn build(&mut self, mod_dir: &Path) -> Result<()> {
+            self.build_dirs.push(mod_dir.to_path_buf());
+            let mod_config = load_mod_config_from_dir(mod_dir)?;
+            let mod_id = match mod_config.mod_id.as_deref() {
+                Some(mod_id) => mod_id.to_owned(),
+                None => mod_id_from_name(&mod_config.name)?,
+            };
+            let version = gradle_mod_version(mod_dir)?;
+            let jar = mod_dir
+                .join(BUILD_FOLDER_NAME)
+                .join("libs")
+                .join(format!("{mod_id}-{version}.jar"));
+            fs::create_dir_all(jar.parent().unwrap()).unwrap();
+            fs::write(jar, b"fake jar").unwrap();
+            Ok(())
+        }
+    }
+
+    fn gradle_mod_version(mod_dir: &Path) -> Result<String> {
+        let properties = fs::read_to_string(mod_dir.join("gradle.properties"))?;
+        properties
+            .lines()
+            .find_map(|line| line.strip_prefix("mod_version=").map(str::to_owned))
+            .context("test gradle.properties did not include mod_version")
     }
 
     #[derive(Debug, PartialEq, Eq)]
