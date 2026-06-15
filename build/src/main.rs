@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -12,11 +12,18 @@ fn main() -> ExitCode {
 
     let env_get = |key: &str| std::env::var(key).ok();
     let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
 
-    match clear_launcher::execute(std::env::args().skip(1), &cwd, &env_get, &mut stdout) {
+    match clear_launcher::execute(
+        std::env::args().skip(1),
+        &cwd,
+        &env_get,
+        &mut stdout,
+        &mut stderr,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("clear-launcher: {error:#}");
+            let _ = writeln!(stderr, "clear-launcher: {error:#}");
             ExitCode::FAILURE
         }
     }

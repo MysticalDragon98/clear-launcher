@@ -26,6 +26,8 @@ Compilation settings are defined in the `settings.yml` file, that must follow th
 
 **CLI:** Rust
 
+
+
 ## 3. Sources
 
 **Inside a Minecraft Launcher:** ./sources/inside-a-minecraft-launcher.md
@@ -36,6 +38,7 @@ Compilation settings are defined in the `settings.yml` file, that must follow th
 2. Verify that the **Compilation Settings File** exists and its valid, if not, abort
 3. Read the **Inside a Minecraft Launcher** source
 4. Build the features described at the **App** section in the **Build Folder**, ensure no files are written outside it on the compilation process
+5. Build the app with `cargo build` or equivalent
 
 ## 5. App
 
@@ -64,7 +67,7 @@ If such version is already installed, abort.
 
 Alias provide ways to have different setups for the same version
 
-## 3. [Command] Path commands
+### 3. [Command] Path commands
 
 **Usage:** 
 
@@ -73,3 +76,6 @@ Alias provide ways to have different setups for the same version
 
 
 
+## 6. CLI Style
+
+**Verbosity:** The CLI by default logs everything that it's doing

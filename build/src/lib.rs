@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -96,12 +97,14 @@ pub fn execute(
     cwd: &Path,
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
+    stderr: &mut impl Write,
 ) -> Result<()> {
     execute_with_services(
         args,
         cwd,
         env_get,
         stdout,
+        stderr,
         fetch_fabric_loader_versions,
         |launcher_root, versions_folder, request| {
             install_minecraft_version_with_alias(
@@ -120,6 +123,7 @@ fn execute_with_services(
     cwd: &Path,
     env_get: &impl Fn(&str) -> Option<String>,
     stdout: &mut impl Write,
+    stderr: &mut impl Write,
     fetch_versions: impl FnOnce() -> Result<Vec<String>>,
     install_version: impl FnOnce(&Path, &Path, &InstallRequest) -> Result<InstalledVersion>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
@@ -132,13 +136,24 @@ fn execute_with_services(
                 bail!("unexpected argument for `versions`: `{extra}`");
             }
 
+            write_log(stderr, format_args!("Loading launcher settings"))?;
             let settings_context = load_settings_context(cwd)?;
             let launcher_root = settings_context
                 .settings
                 .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
             ensure_launcher_root(&launcher_root)?;
+            write_log(stderr, format_args!("Fetching Fabric loader versions"))?;
             let versions = fetch_versions()?;
-            write_versions(&versions, stdout)
+            write_log(
+                stderr,
+                format_args!("Writing {} Fabric loader versions", versions.len()),
+            )?;
+            write_versions(&versions, stdout)?;
+            write_log(stderr, format_args!("Finished listing versions"))
         }
         Some("install") => {
             let requested_version = args.next().with_context(|| {
@@ -149,25 +164,55 @@ fn execute_with_services(
             })?;
             let install_request = parse_install_request(requested_version, args)?;
 
+            write_log(
+                stderr,
+                format_args!(
+                    "Preparing install for requested Minecraft version `{}`",
+                    install_request.requested_version
+                ),
+            )?;
+            if let Some(alias) = install_request.alias.as_deref() {
+                write_log(stderr, format_args!("Using install alias `{alias}`"))?;
+            }
+            write_log(stderr, format_args!("Loading launcher settings"))?;
             let settings_context = load_settings_context(cwd)?;
             let launcher_root = settings_context
                 .settings
                 .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
             ensure_launcher_root(&launcher_root)?;
             let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            write_log(
+                stderr,
+                format_args!("Using versions folder {}", versions_folder.display()),
+            )?;
             let installed = install_version(&launcher_root, &versions_folder, &install_request)?;
-            write_install_output(&installed, stdout)
+            write_log(
+                stderr,
+                format_args!("Writing install result for `{}`", installed.id),
+            )?;
+            write_install_output(&installed, stdout)?;
+            write_log(
+                stderr,
+                format_args!("Finished installing `{}`", installed.id),
+            )
         }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
             }
 
+            write_log(stderr, format_args!("Configuring CLI path"))?;
+            write_log(stderr, format_args!("Loading launcher settings"))?;
             let settings_context = load_settings_context(cwd)?;
             let launcher_root = settings_context
                 .settings
                 .launcher_path_for(OperatingSystem::current()?, env_get)?;
             let cli_name = settings_context.settings.cli_name();
+            write_log(stderr, format_args!("Installing `{cli_name}` into PATH"))?;
             let symlink_path =
                 configure_path(&launcher_root, cli_name, &current_exe()?, cwd, env_get)?;
             writeln!(
@@ -175,28 +220,50 @@ fn execute_with_services(
                 "Configured {cli_name} at {}",
                 symlink_path.display()
             )
-            .context("failed to write configure-path output")
+            .context("failed to write configure-path output")?;
+            write_log(
+                stderr,
+                format_args!("Configured CLI path at {}", symlink_path.display()),
+            )
         }
         Some("unset-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `unset-path`: `{extra}`");
             }
 
+            write_log(stderr, format_args!("Unsetting CLI path"))?;
+            write_log(stderr, format_args!("Loading launcher settings"))?;
             let settings_context = load_settings_context(cwd)?;
             let launcher_root = settings_context
                 .settings
                 .launcher_path_for(OperatingSystem::current()?, env_get)?;
-            match unset_path(&launcher_root)? {
+            write_log(
+                stderr,
+                format_args!("Reading path config from {}", launcher_root.display()),
+            )?;
+            let unset = unset_path(&launcher_root)?;
+            match unset.as_ref() {
                 Some(path) => writeln!(stdout, "Unset {}", path.display()),
                 None => writeln!(stdout, "No path symlink configured"),
             }
-            .context("failed to write unset-path output")
+            .context("failed to write unset-path output")?;
+            match unset {
+                Some(path) => write_log(
+                    stderr,
+                    format_args!("Removed configured CLI path {}", path.display()),
+                ),
+                None => write_log(stderr, format_args!("No configured CLI path to remove")),
+            }
         }
         Some(command) => bail!(
             "unknown command `{command}`\n\n{}",
             usage_text(DEFAULT_CLI_NAME)
         ),
     }
+}
+
+fn write_log(stderr: &mut impl Write, message: fmt::Arguments<'_>) -> Result<()> {
+    writeln!(stderr, "{DEFAULT_CLI_NAME}: {message}").context("failed to write CLI log")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -975,11 +1042,13 @@ cli_name: custom-launcher
         .unwrap();
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         execute_with_services(
             vec!["versions".to_owned()],
             &cwd,
             &test_env,
             &mut stdout,
+            &mut stderr,
             || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
             |_, _, _| unreachable!("versions command should not install versions"),
             || unreachable!("versions command should not inspect the current executable"),
@@ -990,6 +1059,10 @@ cli_name: custom-launcher
             String::from_utf8(stdout).unwrap(),
             "0.19.3\n0.10.6+build.214\n"
         );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Loading launcher settings"));
+        assert!(logs.contains("Fetching Fabric loader versions"));
+        assert!(logs.contains("Finished listing versions"));
         assert!(launcher_root.is_dir());
     }
 
@@ -1064,11 +1137,13 @@ cli_name: custom-launcher
         .unwrap();
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         execute_with_services(
             vec!["install".to_owned(), "1.18".to_owned()],
             &cwd,
             &test_env,
             &mut stdout,
+            &mut stderr,
             || unreachable!("install command should not fetch Fabric versions"),
             |root, versions, requested| {
                 assert_eq!(root, launcher_root.as_path());
@@ -1091,6 +1166,10 @@ cli_name: custom-launcher
         .unwrap();
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "Installed 1.18.2\n");
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Preparing install for requested Minecraft version `1.18`"));
+        assert!(logs.contains("Using versions folder"));
+        assert!(logs.contains("Finished installing `1.18.2`"));
     }
 
     #[test]
@@ -1107,6 +1186,7 @@ cli_name: custom-launcher
         .unwrap();
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         execute_with_services(
             vec![
                 "install".to_owned(),
@@ -1117,6 +1197,7 @@ cli_name: custom-launcher
             &cwd,
             &test_env,
             &mut stdout,
+            &mut stderr,
             || unreachable!("install command should not fetch Fabric versions"),
             |root, versions, requested| {
                 assert_eq!(root, launcher_root.as_path());
@@ -1141,6 +1222,8 @@ cli_name: custom-launcher
             String::from_utf8(stdout).unwrap(),
             "Installed 1.20.4 as survival\n"
         );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Using install alias `survival`"));
     }
 
     #[cfg(unix)]
@@ -1176,11 +1259,13 @@ cli_name: custom-launcher
         };
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         execute_with_services(
             vec!["configure-path".to_owned()],
             &cwd,
             &env,
             &mut stdout,
+            &mut stderr,
             || unreachable!("configure-path should not fetch Fabric versions"),
             |_, _, _| unreachable!("configure-path should not install versions"),
             || Ok(exe_path.clone()),
@@ -1199,13 +1284,18 @@ cli_name: custom-launcher
             String::from_utf8(stdout).unwrap(),
             format!("Configured custom-launcher at {}\n", symlink_path.display())
         );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Configuring CLI path"));
+        assert!(logs.contains("Configured CLI path"));
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         execute_with_services(
             vec!["unset-path".to_owned()],
             &cwd,
             &env,
             &mut stdout,
+            &mut stderr,
             || unreachable!("unset-path should not fetch Fabric versions"),
             |_, _, _| unreachable!("unset-path should not install versions"),
             || unreachable!("unset-path should not inspect the current executable"),
@@ -1223,6 +1313,9 @@ cli_name: custom-launcher
             String::from_utf8(stdout).unwrap(),
             format!("Unset {}\n", symlink_path.display())
         );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Unsetting CLI path"));
+        assert!(logs.contains("Removed configured CLI path"));
     }
 
     #[test]
