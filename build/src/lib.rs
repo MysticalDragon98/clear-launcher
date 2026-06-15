@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = "clear-launcher";
@@ -115,6 +118,9 @@ pub fn execute(
                 request.alias.as_deref(),
             )
         },
+        |launcher_root, versions_folder, request| {
+            run_minecraft_version_offline(launcher_root, versions_folder, request)
+        },
         current_exe_path,
     )
 }
@@ -127,6 +133,7 @@ fn execute_with_services(
     stderr: &mut impl Write,
     fetch_versions: impl FnOnce() -> Result<Vec<String>>,
     install_version: impl FnOnce(&Path, &Path, &InstallRequest) -> Result<InstalledVersion>,
+    run_version: impl FnOnce(&Path, &Path, &RunRequest) -> Result<LaunchedVersion>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<()> {
     let mut args = args.into_iter();
@@ -201,6 +208,54 @@ fn execute_with_services(
                 format_args!("Finished installing `{}`", installed.id),
             )
         }
+        Some("run") => {
+            let requested_version = args.next().with_context(|| {
+                format!(
+                    "missing version for `run`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            let run_request = parse_run_request(requested_version, args)?;
+
+            write_log(
+                stderr,
+                format_args!(
+                    "Preparing run for requested Minecraft version `{}`",
+                    run_request.requested_version
+                ),
+            )?;
+            if let Some(alias) = run_request.alias.as_deref() {
+                write_log(stderr, format_args!("Using run alias `{alias}`"))?;
+            }
+            write_log(
+                stderr,
+                format_args!("Using offline username `{}`", run_request.username),
+            )?;
+            write_log(stderr, format_args!("Loading launcher settings"))?;
+            let settings_context = load_settings_context(cwd)?;
+            let launcher_root = settings_context
+                .settings
+                .launcher_path_for(OperatingSystem::current()?, env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
+            ensure_launcher_root(&launcher_root)?;
+            let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            write_log(
+                stderr,
+                format_args!("Using versions folder {}", versions_folder.display()),
+            )?;
+            let launched = run_version(&launcher_root, &versions_folder, &run_request)?;
+            write_run_output(&launched, stdout)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Finished running `{}` as `{}`",
+                    launched.id, launched.username
+                ),
+            )
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -273,6 +328,13 @@ pub struct InstallRequest {
     pub alias: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRequest {
+    pub requested_version: String,
+    pub alias: Option<String>,
+    pub username: String,
+}
+
 fn parse_install_request(
     requested_version: String,
     mut args: impl Iterator<Item = String>,
@@ -298,12 +360,65 @@ fn parse_install_request(
     })
 }
 
+fn parse_run_request(
+    requested_version: String,
+    mut args: impl Iterator<Item = String>,
+) -> Result<RunRequest> {
+    let mut alias = None;
+    let mut username = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--alias" {
+            let value = args
+                .next()
+                .context("missing value for `--alias` in `run`")?;
+            set_run_alias(&mut alias, value)?;
+        } else if let Some(value) = arg.strip_prefix("--alias=") {
+            set_run_alias(&mut alias, value.to_owned())?;
+        } else if arg == "--username" {
+            let value = args
+                .next()
+                .context("missing value for `--username` in `run`")?;
+            set_run_username(&mut username, value)?;
+        } else if let Some(value) = arg.strip_prefix("--username=") {
+            set_run_username(&mut username, value.to_owned())?;
+        } else {
+            bail!("unexpected argument for `run`: `{arg}`");
+        }
+    }
+
+    let username = username.context("missing required `--username` for `run`")?;
+
+    Ok(RunRequest {
+        requested_version,
+        alias,
+        username,
+    })
+}
+
 fn set_install_alias(alias: &mut Option<String>, value: String) -> Result<()> {
+    set_alias(alias, value, "install alias")
+}
+
+fn set_run_alias(alias: &mut Option<String>, value: String) -> Result<()> {
+    set_alias(alias, value, "run alias")
+}
+
+fn set_alias(alias: &mut Option<String>, value: String, label: &str) -> Result<()> {
     if alias.is_some() {
         bail!("`--alias` was provided more than once");
     }
-    validate_path_segment(&value, "install alias")?;
+    validate_path_segment(&value, label)?;
     *alias = Some(value);
+    Ok(())
+}
+
+fn set_run_username(username: &mut Option<String>, value: String) -> Result<()> {
+    if username.is_some() {
+        bail!("`--username` was provided more than once");
+    }
+    validate_username(&value)?;
+    *username = Some(value);
     Ok(())
 }
 
@@ -570,6 +685,326 @@ pub struct InstalledVersion {
     pub alias: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchedVersion {
+    pub id: String,
+    pub alias: Option<String>,
+    pub username: String,
+}
+
+pub fn run_minecraft_version_offline(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    request: &RunRequest,
+) -> Result<LaunchedVersion> {
+    let mut downloader = HttpDownloader::new();
+    let mut launcher = ProcessJavaLauncher;
+    run_minecraft_version_offline_with_services(
+        launcher_root,
+        versions_folder,
+        request,
+        &mut downloader,
+        &mut launcher,
+    )
+}
+
+fn run_minecraft_version_offline_with_services(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    request: &RunRequest,
+    downloader: &mut impl Downloader,
+    launcher: &mut impl JavaLauncher,
+) -> Result<LaunchedVersion> {
+    validate_username(&request.username)?;
+    if let Some(alias) = request.alias.as_deref() {
+        validate_path_segment(alias, "run alias")?;
+    }
+
+    let manifest = downloader.download_string(MINECRAFT_VERSION_MANIFEST_URL)?;
+    let manifest = parse_minecraft_version_manifest(&manifest)?;
+    let selected = resolve_minecraft_version(&manifest, &request.requested_version)?;
+    let version_id = selected.id.clone();
+    validate_path_segment(&version_id, "resolved version id")?;
+    let install_name = request.alias.as_deref().unwrap_or(DEFAULT_INSTALL_ALIAS);
+    validate_path_segment(install_name, "run alias")?;
+
+    let version_dir = versions_folder.join(&version_id).join(install_name);
+    if !version_dir
+        .try_exists()
+        .with_context(|| format!("failed to inspect `{}`", version_dir.display()))?
+    {
+        bail!(
+            "Minecraft version `{version_id}` with alias `{install_name}` is not installed at `{}`",
+            version_dir.display()
+        );
+    }
+
+    let command = build_launch_command(
+        launcher_root,
+        &version_dir,
+        &version_id,
+        install_name,
+        request,
+    )?;
+    launcher.launch(&command)?;
+
+    Ok(LaunchedVersion {
+        id: version_id,
+        alias: request.alias.clone(),
+        username: request.username.clone(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JavaLaunchCommand {
+    program: String,
+    args: Vec<String>,
+    current_dir: PathBuf,
+}
+
+trait JavaLauncher {
+    fn launch(&mut self, command: &JavaLaunchCommand) -> Result<()>;
+}
+
+struct ProcessJavaLauncher;
+
+impl JavaLauncher for ProcessJavaLauncher {
+    fn launch(&mut self, command: &JavaLaunchCommand) -> Result<()> {
+        let status = Command::new(&command.program)
+            .args(&command.args)
+            .current_dir(&command.current_dir)
+            .status()
+            .with_context(|| format!("failed to start `{}`", command.program))?;
+
+        if !status.success() {
+            match status.code() {
+                Some(code) => bail!("Minecraft exited with status code {code}"),
+                None => bail!("Minecraft was terminated by signal"),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn build_launch_command(
+    launcher_root: &Path,
+    version_dir: &Path,
+    version_id: &str,
+    install_name: &str,
+    request: &RunRequest,
+) -> Result<JavaLaunchCommand> {
+    let version_json_path = version_dir.join(format!("{install_name}.json"));
+    let version_json = fs::read_to_string(&version_json_path)
+        .with_context(|| format!("failed to read `{}`", version_json_path.display()))?;
+    let version_data = parse_minecraft_version_data(&version_json)?;
+    let main_class = version_data
+        .main_class
+        .as_deref()
+        .context("installed Minecraft version does not include a main class")?;
+    let client_jar = version_dir.join(format!("{install_name}.jar"));
+    if !client_jar.is_file() {
+        bail!(
+            "installed Minecraft client jar is missing at `{}`",
+            client_jar.display()
+        );
+    }
+
+    let classpath = build_classpath(launcher_root, &client_jar, &version_data.libraries)?;
+    let context = LaunchArgumentContext {
+        launcher_root,
+        version_dir,
+        version_id,
+        username: &request.username,
+        classpath: &classpath,
+        client_jar: &client_jar,
+        asset_index_name: version_data
+            .asset_index
+            .as_ref()
+            .map(|asset_index| asset_index.id.as_str())
+            .unwrap_or(version_id),
+        version_type: version_data.version_type.as_deref().unwrap_or("release"),
+        offline_uuid: offline_player_uuid(&request.username),
+    };
+
+    let jvm_templates = version_data
+        .arguments
+        .as_ref()
+        .map(|arguments| collect_launch_arguments(&arguments.jvm))
+        .transpose()?
+        .unwrap_or_default();
+    let mut jvm_args = jvm_templates
+        .iter()
+        .map(|argument| substitute_launch_argument(argument, &context))
+        .collect::<Vec<_>>();
+    if !launch_arguments_supply_classpath(&jvm_templates) {
+        jvm_args.push("-Djava.library.path=${natives_directory}".to_owned());
+        jvm_args.push("-cp".to_owned());
+        jvm_args.push("${classpath}".to_owned());
+        jvm_args = jvm_args
+            .iter()
+            .map(|argument| substitute_launch_argument(argument, &context))
+            .collect();
+    }
+
+    let game_templates = if let Some(arguments) = version_data.arguments.as_ref() {
+        collect_launch_arguments(&arguments.game)?
+    } else if let Some(arguments) = version_data.minecraft_arguments.as_deref() {
+        arguments
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        bail!("installed Minecraft version does not include launch arguments");
+    };
+    let game_args = game_templates
+        .iter()
+        .map(|argument| substitute_launch_argument(argument, &context))
+        .collect::<Vec<_>>();
+
+    let mut args = Vec::with_capacity(jvm_args.len() + 1 + game_args.len());
+    args.extend(jvm_args);
+    args.push(main_class.to_owned());
+    args.extend(game_args);
+
+    Ok(JavaLaunchCommand {
+        program: "java".to_owned(),
+        args,
+        current_dir: launcher_root.to_path_buf(),
+    })
+}
+
+fn build_classpath(
+    launcher_root: &Path,
+    client_jar: &Path,
+    libraries: &[MinecraftLibrary],
+) -> Result<String> {
+    let os = OperatingSystem::current()?;
+    let mut classpath = Vec::new();
+
+    for library in libraries {
+        if !allowed_by_rules(library.rules.as_deref(), os) {
+            continue;
+        }
+        let Some(path) = library
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .and_then(|artifact| artifact.path.as_deref())
+        else {
+            continue;
+        };
+
+        let library_path = launcher_root.join("libraries").join(path);
+        if !library_path.is_file() {
+            bail!(
+                "installed Minecraft library is missing at `{}`",
+                library_path.display()
+            );
+        }
+        classpath.push(library_path);
+    }
+
+    classpath.push(client_jar.to_path_buf());
+    join_classpath(classpath)
+}
+
+fn join_classpath(paths: Vec<PathBuf>) -> Result<String> {
+    let paths = paths.into_iter().map(OsString::from).collect::<Vec<_>>();
+    std::env::join_paths(paths)
+        .context("failed to join Minecraft classpath")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("Minecraft classpath contains non-UTF-8 paths"))
+}
+
+struct LaunchArgumentContext<'a> {
+    launcher_root: &'a Path,
+    version_dir: &'a Path,
+    version_id: &'a str,
+    username: &'a str,
+    classpath: &'a str,
+    client_jar: &'a Path,
+    asset_index_name: &'a str,
+    version_type: &'a str,
+    offline_uuid: String,
+}
+
+fn collect_launch_arguments(arguments: &[MinecraftArgument]) -> Result<Vec<String>> {
+    let os = OperatingSystem::current()?;
+    let mut collected = Vec::new();
+
+    for argument in arguments {
+        if !argument.allowed(os) {
+            continue;
+        }
+        argument.extend_values(&mut collected);
+    }
+
+    Ok(collected)
+}
+
+fn launch_arguments_supply_classpath(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        argument == "-cp"
+            || argument == "-classpath"
+            || argument.contains("${classpath}")
+            || argument.contains("${primary_jar}")
+    })
+}
+
+fn substitute_launch_argument(argument: &str, context: &LaunchArgumentContext<'_>) -> String {
+    let libraries_dir = context.launcher_root.join("libraries");
+    let assets_root = context.launcher_root.join("assets");
+    let natives_dir = context.version_dir.join("natives");
+    let game_directory = context.launcher_root;
+    let separator = if cfg!(windows) { ";" } else { ":" };
+
+    let replacements = [
+        ("${natives_directory}", path_to_string(&natives_dir)),
+        ("${launcher_name}", DEFAULT_CLI_NAME.to_owned()),
+        ("${launcher_version}", env!("CARGO_PKG_VERSION").to_owned()),
+        ("${classpath}", context.classpath.to_owned()),
+        ("${classpath_separator}", separator.to_owned()),
+        ("${primary_jar}", path_to_string(context.client_jar)),
+        ("${library_directory}", path_to_string(&libraries_dir)),
+        ("${game_directory}", path_to_string(game_directory)),
+        ("${auth_player_name}", context.username.to_owned()),
+        ("${version_name}", context.version_id.to_owned()),
+        ("${assets_root}", path_to_string(&assets_root)),
+        ("${assets_index_name}", context.asset_index_name.to_owned()),
+        ("${auth_uuid}", context.offline_uuid.clone()),
+        ("${auth_access_token}", "0".to_owned()),
+        ("${user_type}", "legacy".to_owned()),
+        ("${version_type}", context.version_type.to_owned()),
+        ("${user_properties}", "{}".to_owned()),
+        ("${clientid}", String::new()),
+        ("${auth_xuid}", String::new()),
+    ];
+
+    let mut substituted = argument.to_owned();
+    for (token, value) in replacements {
+        substituted = substituted.replace(token, &value);
+    }
+    substituted
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn offline_player_uuid(username: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut hash = Md5::digest(format!("OfflinePlayer:{username}").as_bytes());
+    hash[6] = (hash[6] & 0x0f) | 0x30;
+    hash[8] = (hash[8] & 0x3f) | 0x80;
+    let mut uuid = String::with_capacity(32);
+    for byte in hash {
+        write!(&mut uuid, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    uuid
+}
+
 pub fn install_minecraft_version(
     launcher_root: &Path,
     versions_folder: &Path,
@@ -645,7 +1080,12 @@ fn install_minecraft_version_with_downloader(
         install_assets(launcher_root, &asset_index, downloader)?;
     }
 
-    install_libraries(launcher_root, version_data.libraries, downloader)?;
+    install_libraries(
+        launcher_root,
+        &version_dir,
+        version_data.libraries,
+        downloader,
+    )?;
 
     Ok(InstalledVersion {
         id: version_id,
@@ -691,20 +1131,99 @@ fn install_assets(
 
 fn install_libraries(
     launcher_root: &Path,
+    version_dir: &Path,
     libraries: Vec<MinecraftLibrary>,
     downloader: &mut impl Downloader,
 ) -> Result<()> {
+    let os = OperatingSystem::current()?;
+    let natives_dir = version_dir.join("natives");
+
     for library in libraries {
-        let Some(artifact) = library.downloads.and_then(|downloads| downloads.artifact) else {
+        if !allowed_by_rules(library.rules.as_deref(), os) {
             continue;
-        };
-        let Some(path) = artifact.path else {
-            continue;
-        };
-        downloader.download_to_path(&artifact.url, &launcher_root.join("libraries").join(path))?;
+        }
+
+        if let Some(artifact) = library
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+        {
+            if let Some(path) = artifact.path.as_deref() {
+                downloader
+                    .download_to_path(&artifact.url, &launcher_root.join("libraries").join(path))?;
+            }
+        }
+
+        if let Some(native) = native_library_download(&library, os) {
+            let path = native.path.as_deref().with_context(|| {
+                format!(
+                    "native library `{}` does not include a download path",
+                    library.name.as_deref().unwrap_or("unknown")
+                )
+            })?;
+            let native_archive = launcher_root.join("libraries").join(path);
+            downloader.download_to_path(&native.url, &native_archive)?;
+            extract_native_archive(&native_archive, &natives_dir)?;
+        }
     }
 
     Ok(())
+}
+
+fn native_library_download(
+    library: &MinecraftLibrary,
+    os: OperatingSystem,
+) -> Option<&DownloadInfo> {
+    let classifier = library
+        .natives
+        .as_ref()?
+        .get(minecraft_os_name(os))?
+        .replace("${arch}", native_arch_bits());
+    library
+        .downloads
+        .as_ref()?
+        .classifiers
+        .as_ref()?
+        .get(&classifier)
+}
+
+fn extract_native_archive(archive_path: &Path, natives_dir: &Path) -> Result<()> {
+    fs::create_dir_all(natives_dir)
+        .with_context(|| format!("failed to create `{}`", natives_dir.display()))?;
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("failed to open `{}`", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read native archive `{}`", archive_path.display()))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).with_context(|| {
+            format!(
+                "failed to read entry {index} from `{}`",
+                archive_path.display()
+            )
+        })?;
+        if !is_native_library_name(entry.name()) {
+            continue;
+        }
+        let Some(file_name) = Path::new(entry.name()).file_name() else {
+            continue;
+        };
+        let output_path = natives_dir.join(file_name);
+        let mut output = fs::File::create(&output_path)
+            .with_context(|| format!("failed to create `{}`", output_path.display()))?;
+        io::copy(&mut entry, &mut output)
+            .with_context(|| format!("failed to write `{}`", output_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn is_native_library_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".dll")
+        || lower.ends_with(".so")
+        || lower.ends_with(".dylib")
+        || lower.ends_with(".jnilib")
 }
 
 fn parse_minecraft_version_manifest(manifest: &str) -> Result<MinecraftVersionManifest> {
@@ -775,6 +1294,62 @@ fn is_major_version_request(version: &str) -> bool {
         && !minor.is_empty()
         && major.chars().all(|character| character.is_ascii_digit())
         && minor.chars().all(|character| character.is_ascii_digit())
+}
+
+fn allowed_by_rules(rules: Option<&[MinecraftRule]>, os: OperatingSystem) -> bool {
+    let Some(rules) = rules else {
+        return true;
+    };
+
+    let mut allowed = false;
+    for rule in rules {
+        if rule_matches(rule, os) {
+            allowed = rule.action == "allow";
+        }
+    }
+    allowed
+}
+
+fn rule_matches(rule: &MinecraftRule, os: OperatingSystem) -> bool {
+    if let Some(rule_os) = rule.os.as_ref() {
+        if let Some(name) = rule_os.name.as_deref() {
+            if name != minecraft_os_name(os) {
+                return false;
+            }
+        }
+        if let Some(arch) = rule_os.arch.as_deref() {
+            if arch != std::env::consts::ARCH {
+                return false;
+            }
+        }
+        if rule_os.version.is_some() {
+            return false;
+        }
+    }
+
+    if let Some(features) = rule.features.as_ref() {
+        if features.values().any(|enabled| *enabled) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn minecraft_os_name(os: OperatingSystem) -> &'static str {
+    match os {
+        OperatingSystem::Linux => "linux",
+        OperatingSystem::Macos => "osx",
+        OperatingSystem::Windows => "windows",
+    }
+}
+
+fn native_arch_bits() -> &'static str {
+    if std::env::consts::ARCH.contains("64") {
+        "64"
+    } else {
+        "32"
+    }
 }
 
 trait Downloader {
@@ -945,11 +1520,68 @@ struct MinecraftManifestVersion {
 
 #[derive(Debug, Deserialize)]
 struct MinecraftVersionData {
+    #[serde(default)]
+    arguments: Option<MinecraftLaunchArguments>,
     #[serde(rename = "assetIndex")]
     asset_index: Option<AssetIndex>,
     downloads: MinecraftDownloads,
     #[serde(default)]
     libraries: Vec<MinecraftLibrary>,
+    #[serde(rename = "mainClass")]
+    main_class: Option<String>,
+    #[serde(rename = "minecraftArguments")]
+    minecraft_arguments: Option<String>,
+    #[serde(rename = "type")]
+    version_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftLaunchArguments {
+    #[serde(default)]
+    game: Vec<MinecraftArgument>,
+    #[serde(default)]
+    jvm: Vec<MinecraftArgument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MinecraftArgument {
+    Value(ArgumentValue),
+    Conditional {
+        rules: Vec<MinecraftRule>,
+        value: ArgumentValue,
+    },
+}
+
+impl MinecraftArgument {
+    fn allowed(&self, os: OperatingSystem) -> bool {
+        match self {
+            Self::Value(_) => true,
+            Self::Conditional { rules, .. } => allowed_by_rules(Some(rules.as_slice()), os),
+        }
+    }
+
+    fn extend_values(&self, values: &mut Vec<String>) {
+        match self {
+            Self::Value(value) | Self::Conditional { value, .. } => value.extend(values),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ArgumentValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ArgumentValue {
+    fn extend(&self, values: &mut Vec<String>) {
+        match self {
+            Self::One(value) => values.push(value.clone()),
+            Self::Many(items) => values.extend(items.iter().cloned()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -960,11 +1592,15 @@ struct MinecraftDownloads {
 #[derive(Debug, Deserialize)]
 struct MinecraftLibrary {
     downloads: Option<LibraryDownloads>,
+    name: Option<String>,
+    natives: Option<HashMap<String, String>>,
+    rules: Option<Vec<MinecraftRule>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct LibraryDownloads {
     artifact: Option<DownloadInfo>,
+    classifiers: Option<HashMap<String, DownloadInfo>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -987,6 +1623,20 @@ struct AssetObjects {
 #[derive(Debug, Deserialize)]
 struct AssetObject {
     hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftRule {
+    action: String,
+    features: Option<HashMap<String, bool>>,
+    os: Option<MinecraftRuleOs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftRuleOs {
+    arch: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
 }
 
 pub fn expand_path(raw_path: &str, env_get: &impl Fn(&str) -> Option<String>) -> Result<PathBuf> {
@@ -1026,6 +1676,22 @@ fn validate_path_segment(value: &str, label: &str) -> Result<()> {
     }
 }
 
+fn validate_username(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("username cannot be empty");
+    }
+    if value.trim() != value {
+        bail!("username cannot contain leading or trailing whitespace");
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        bail!("username can only contain ASCII letters, numbers, and underscores");
+    }
+    Ok(())
+}
+
 fn write_versions(versions: &[String], stdout: &mut impl Write) -> Result<()> {
     for version in versions {
         writeln!(stdout, "{version}").context("failed to write version output")?;
@@ -1041,13 +1707,25 @@ fn write_install_output(installed: &InstalledVersion, stdout: &mut impl Write) -
     .context("failed to write install output")
 }
 
+fn write_run_output(launched: &LaunchedVersion, stdout: &mut impl Write) -> Result<()> {
+    match launched.alias.as_deref() {
+        Some(alias) => writeln!(
+            stdout,
+            "Ran {} as {} with alias {alias}",
+            launched.id, launched.username
+        ),
+        None => writeln!(stdout, "Ran {} as {}", launched.id, launched.username),
+    }
+    .context("failed to write run output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -1144,6 +1822,7 @@ cli_name: custom-launcher
             &mut stderr,
             || Ok(vec!["0.19.3".to_owned(), "0.10.6+build.214".to_owned()]),
             |_, _, _| unreachable!("versions command should not install versions"),
+            |_, _, _| unreachable!("versions command should not run versions"),
             || unreachable!("versions command should not inspect the current executable"),
         )
         .unwrap();
@@ -1254,6 +1933,7 @@ cli_name: custom-launcher
                     alias: None,
                 })
             },
+            |_, _, _| unreachable!("install command should not run versions"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -1307,6 +1987,7 @@ cli_name: custom-launcher
                     alias: requested.alias.clone(),
                 })
             },
+            |_, _, _| unreachable!("install command should not run versions"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -1317,6 +1998,213 @@ cli_name: custom-launcher
         );
         let logs = String::from_utf8(stderr).unwrap();
         assert!(logs.contains("Using install alias `survival`"));
+    }
+
+    #[test]
+    fn run_command_reads_settings_and_runs_requested_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            repo.path().join(SETTINGS_FILE),
+            format!("launcher_path:\n  linux: \"{}\"\n", launcher_root.display()),
+        )
+        .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        execute_with_services(
+            vec![
+                "run".to_owned(),
+                "1.18".to_owned(),
+                "--alias".to_owned(),
+                "survival".to_owned(),
+                "--username".to_owned(),
+                "Player_1".to_owned(),
+            ],
+            &cwd,
+            &test_env,
+            &mut stdout,
+            &mut stderr,
+            || unreachable!("run command should not fetch Fabric versions"),
+            |_, _, _| unreachable!("run command should not install versions"),
+            |root, versions, requested| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(versions, versions_folder.as_path());
+                assert_eq!(
+                    requested,
+                    &RunRequest {
+                        requested_version: "1.18".to_owned(),
+                        alias: Some("survival".to_owned()),
+                        username: "Player_1".to_owned(),
+                    }
+                );
+                assert!(root.is_dir());
+                Ok(LaunchedVersion {
+                    id: "1.18.2".to_owned(),
+                    alias: requested.alias.clone(),
+                    username: requested.username.clone(),
+                })
+            },
+            || unreachable!("run command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "Ran 1.18.2 as Player_1 with alias survival\n"
+        );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Preparing run for requested Minecraft version `1.18`"));
+        assert!(logs.contains("Using run alias `survival`"));
+        assert!(logs.contains("Using offline username `Player_1`"));
+        assert!(logs.contains("Finished running `1.18.2` as `Player_1`"));
+    }
+
+    #[test]
+    fn run_builds_offline_java_launch_command_from_installed_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        let version_dir = versions_folder.join("1.20.4/default");
+        let library_path = launcher_root.join("libraries/org/example/lib/1.0/lib-1.0.jar");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::create_dir_all(library_path.parent().unwrap()).unwrap();
+        fs::write(version_dir.join("default.jar"), "client").unwrap();
+        fs::write(&library_path, "library").unwrap();
+        fs::write(
+            version_dir.join("default.json"),
+            r#"
+{
+  "type": "release",
+  "mainClass": "net.minecraft.client.main.Main",
+  "assetIndex": {
+    "id": "1.20",
+    "url": "https://example.test/assets/1.20.json"
+  },
+  "arguments": {
+    "jvm": [
+      "-Djava.library.path=${natives_directory}",
+      "-Dminecraft.launcher.brand=${launcher_name}",
+      "-cp",
+      "${classpath}"
+    ],
+    "game": [
+      "--username",
+      "${auth_player_name}",
+      "--uuid",
+      "${auth_uuid}",
+      "--accessToken",
+      "${auth_access_token}",
+      "--version",
+      "${version_name}",
+      "--gameDir",
+      "${game_directory}",
+      "--assetsDir",
+      "${assets_root}",
+      "--assetIndex",
+      "${assets_index_name}",
+      "--userType",
+      "${user_type}",
+      {
+        "rules": [
+          {
+            "action": "allow",
+            "features": {
+              "is_demo_user": true
+            }
+          }
+        ],
+        "value": "--demo"
+      }
+    ]
+  },
+  "downloads": {
+    "client": {
+      "url": "https://example.test/client.jar"
+    }
+  },
+  "libraries": [
+    {
+      "downloads": {
+        "artifact": {
+          "path": "org/example/lib/1.0/lib-1.0.jar",
+          "url": "https://example.test/lib-1.0.jar"
+        }
+      }
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let mut downloader = FakeDownloader::new([(
+            MINECRAFT_VERSION_MANIFEST_URL,
+            r#"
+{
+  "latest": {
+    "release": "1.20.4",
+    "snapshot": "23w13a_or_b"
+  },
+  "versions": [
+    {
+      "id": "1.20.4",
+      "type": "release",
+      "url": "https://example.test/1.20.4.json"
+    }
+  ]
+}
+"#,
+        )]);
+        let mut launcher = FakeJavaLauncher::default();
+        let request = RunRequest {
+            requested_version: "latest".to_owned(),
+            alias: None,
+            username: "Player_1".to_owned(),
+        };
+
+        let launched = run_minecraft_version_offline_with_services(
+            &launcher_root,
+            &versions_folder,
+            &request,
+            &mut downloader,
+            &mut launcher,
+        )
+        .unwrap();
+
+        assert_eq!(
+            launched,
+            LaunchedVersion {
+                id: "1.20.4".to_owned(),
+                alias: None,
+                username: "Player_1".to_owned(),
+            }
+        );
+        let command = launcher.command.unwrap();
+        assert_eq!(command.program, "java");
+        assert_eq!(command.current_dir, launcher_root);
+        assert!(
+            command
+                .args
+                .contains(&"net.minecraft.client.main.Main".to_owned())
+        );
+        assert!(command.args.contains(&"Player_1".to_owned()));
+        assert!(command.args.contains(&offline_player_uuid("Player_1")));
+        assert!(command.args.contains(&"0".to_owned()));
+        assert!(command.args.contains(&"legacy".to_owned()));
+        assert!(!command.args.contains(&"--demo".to_owned()));
+        let classpath_index = command
+            .args
+            .iter()
+            .position(|argument| argument == "-cp")
+            .unwrap()
+            + 1;
+        let classpath = &command.args[classpath_index];
+        assert!(classpath.contains("org/example/lib/1.0/lib-1.0.jar"));
+        assert!(classpath.contains("versions/1.20.4/default/default.jar"));
     }
 
     #[cfg(unix)]
@@ -1361,6 +2249,7 @@ cli_name: custom-launcher
             &mut stderr,
             || unreachable!("configure-path should not fetch Fabric versions"),
             |_, _, _| unreachable!("configure-path should not install versions"),
+            |_, _, _| unreachable!("configure-path should not run versions"),
             || Ok(exe_path.clone()),
         )
         .unwrap();
@@ -1391,6 +2280,7 @@ cli_name: custom-launcher
             &mut stderr,
             || unreachable!("unset-path should not fetch Fabric versions"),
             |_, _, _| unreachable!("unset-path should not install versions"),
+            |_, _, _| unreachable!("unset-path should not run versions"),
             || unreachable!("unset-path should not inspect the current executable"),
         )
         .unwrap();
@@ -1616,6 +2506,18 @@ cli_name: custom-launcher
 
     struct FakeDownloader {
         strings: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FakeJavaLauncher {
+        command: Option<JavaLaunchCommand>,
+    }
+
+    impl JavaLauncher for FakeJavaLauncher {
+        fn launch(&mut self, command: &JavaLaunchCommand) -> Result<()> {
+            self.command = Some(command.clone());
+            Ok(())
+        }
     }
 
     impl FakeDownloader {

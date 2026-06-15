@@ -76,6 +76,12 @@ Alias provide ways to have different setups for the same version
 
 
 
+### 4. [Command] Running minecraft
+
+**Usage:** `{CLI Name} run {version} [--alias {alias}] --username {username}`
+
+Runs the minecraft game in **offline** mode with the specified username, the version is resolved in the similar way of **install**
+
 ## 6. CLI Style
 
 **Verbosity:** The CLI by default logs everything that it's doing
