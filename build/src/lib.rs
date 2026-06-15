@@ -19,6 +19,7 @@ pub const DEFAULT_WINDOWS_LAUNCHER_PATH: &str = env!("CLEAR_LAUNCHER_LAUNCHER_PA
 pub const CONFIG_FILE_NAME: &str = "config.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
+pub const MODS_FOLDER_NAME: &str = "mods";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 pub const FABRIC_GAME_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/game";
@@ -782,6 +783,7 @@ fn run_minecraft_version_offline_with_services(
             version_dir.display()
         );
     }
+    ensure_version_mods_dir(&version_dir)?;
 
     let command = build_launch_command(
         launcher_root,
@@ -905,7 +907,7 @@ fn build_launch_command(
     Ok(JavaLaunchCommand {
         program: "java".to_owned(),
         args,
-        current_dir: launcher_root.to_path_buf(),
+        current_dir: version_dir.to_path_buf(),
     })
 }
 
@@ -1004,7 +1006,7 @@ fn substitute_launch_argument(argument: &str, context: &LaunchArgumentContext<'_
     let libraries_dir = context.launcher_root.join("libraries");
     let assets_root = context.launcher_root.join("assets");
     let natives_dir = context.version_dir.join("natives");
-    let game_directory = context.launcher_root;
+    let game_directory = context.version_dir;
     let separator = if cfg!(windows) { ";" } else { ":" };
 
     let replacements = [
@@ -1114,6 +1116,7 @@ fn install_minecraft_version_with_downloader(
 
     fs::create_dir_all(&version_dir)
         .with_context(|| format!("failed to create `{}`", version_dir.display()))?;
+    ensure_version_mods_dir(&version_dir)?;
     fs::write(
         version_dir.join(format!("{install_name}.json")),
         &installed_version_json,
@@ -1144,6 +1147,13 @@ fn install_minecraft_version_with_downloader(
         id: version_id,
         alias: alias.map(str::to_owned),
     })
+}
+
+fn ensure_version_mods_dir(version_dir: &Path) -> Result<PathBuf> {
+    let mods_dir = version_dir.join(MODS_FOLDER_NAME);
+    fs::create_dir_all(&mods_dir)
+        .with_context(|| format!("failed to create `{}`", mods_dir.display()))?;
+    Ok(mods_dir)
 }
 
 fn merge_minecraft_and_fabric_version_data(
@@ -2434,7 +2444,7 @@ mod tests {
         );
         let command = launcher.command.unwrap();
         assert_eq!(command.program, "java");
-        assert_eq!(command.current_dir, launcher_root);
+        assert_eq!(command.current_dir, version_dir);
         assert!(
             command
                 .args
@@ -2454,6 +2464,14 @@ mod tests {
         let classpath = &command.args[classpath_index];
         assert!(classpath.contains("org/example/lib/1.0/lib-1.0.jar"));
         assert!(classpath.contains("versions/1.20.4/default/default.jar"));
+        let game_dir_index = command
+            .args
+            .iter()
+            .position(|argument| argument == "--gameDir")
+            .unwrap()
+            + 1;
+        assert_eq!(command.args[game_dir_index], path_to_string(&version_dir));
+        assert!(version_dir.join(MODS_FOLDER_NAME).is_dir());
     }
 
     #[cfg(unix)]
@@ -2684,6 +2702,7 @@ mod tests {
             b"https://example.test/client.jar"
         );
         assert!(launcher_root.join("versions/1.18.2/default").exists());
+        assert!(launcher_root.join("versions/1.18.2/default/mods").is_dir());
         assert!(launcher_root.join("assets/indexes/1.18.json").is_file());
         assert_eq!(
             fs::read(
@@ -2803,6 +2822,7 @@ mod tests {
             fs::read(versions_folder.join("1.20.4/survival/survival.jar")).unwrap(),
             b"https://example.test/client.jar"
         );
+        assert!(versions_folder.join("1.20.4/survival/mods").is_dir());
         assert!(
             launcher_root
                 .join("libraries/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar")

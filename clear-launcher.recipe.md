@@ -9,6 +9,7 @@ Clear code minecraft launcher
 **CLI Name:** Nombre con el cual será instalada la CLI
 **Versions Folder:**  {Launcher Path}/versions - Folder where minecraft versions are installed
 **Config File:** {Launcher Path}/config.yml file that stores the local configuration
+**Version Folder:** Do not confuse with **Versions Folder**, the **Version Folder** is an specific installed version of minecraft at `{Versions Folder}/{version}/{alias}`
 
 ## 1. Compilation Settings
 
@@ -88,3 +89,9 @@ Runs the minecraft game in **offline** mode with the specified username, the ver
 
 **Verbosity:** The CLI by default logs everything that it's doing
 **Progress Bars:** All actions that can be measured with a progress bar (Quantificable) **MUST** be represented in an animated progress bar in order to let the user know what is the action that is doing and what's the progress on it
+
+
+
+## 7. Mods
+
+Mods are scoped per **version** and belongs to a **Version Folder** at `{Version Folder}/mods`, the **Fabric Loader** must load the mods inside that folder when launching the minecraft version
