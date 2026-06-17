@@ -27,6 +27,8 @@ pub const TEST_MINECRAFT_FOLDER_NAME: &str = ".minecraft";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const MODS_FOLDER_NAME: &str = "mods";
 pub const REMOTE_MANIFEST_FILE_NAME: &str = "remote.yml";
+const OFFLINE_LAN_PATCH_JAR_NAME: &str = ".clear-launcher-offline-lan.jar";
+const INTEGRATED_SERVER_CLASS: &str = "net/minecraft/client/server/IntegratedServer.class";
 pub const DEFAULT_OPEN_ADDRESS: &str = "0.0.0.0:7878";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const DEFAULT_EDITOR: &str = "code";
@@ -4020,7 +4022,13 @@ fn build_launch_command(
         );
     }
 
-    let classpath = build_classpath(launcher_root, &client_jar, &version_data.libraries)?;
+    let offline_lan_patch_jar = ensure_offline_lan_patch_jar(version_dir, &client_jar)?;
+    let classpath = build_classpath(
+        launcher_root,
+        &client_jar,
+        &version_data.libraries,
+        offline_lan_patch_jar.as_deref(),
+    )?;
     let context = LaunchArgumentContext {
         launcher_root,
         version_dir,
@@ -4094,13 +4102,181 @@ fn game_launch_arguments(version_data: &MinecraftVersionData) -> Result<Vec<Stri
     bail!("installed Minecraft version does not include launch arguments");
 }
 
+fn ensure_offline_lan_patch_jar(version_dir: &Path, client_jar: &Path) -> Result<Option<PathBuf>> {
+    let file = fs::File::open(client_jar)
+        .with_context(|| format!("failed to open `{}`", client_jar.display()))?;
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(_) => return Ok(None),
+    };
+    let mut class_entry = match archive.by_name(INTEGRATED_SERVER_CLASS) {
+        Ok(class_entry) => class_entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read `{INTEGRATED_SERVER_CLASS}` from `{}`",
+                    client_jar.display()
+                )
+            });
+        }
+    };
+    let mut class = Vec::new();
+    class_entry.read_to_end(&mut class).with_context(|| {
+        format!(
+            "failed to read `{INTEGRATED_SERVER_CLASS}` from `{}`",
+            client_jar.display()
+        )
+    })?;
+
+    let patched = patch_integrated_server_lan_auth(&class)?.with_context(|| {
+        format!("failed to patch `{INTEGRATED_SERVER_CLASS}` for offline LAN auth")
+    })?;
+    let patch_jar = version_dir.join(OFFLINE_LAN_PATCH_JAR_NAME);
+    let output = fs::File::create(&patch_jar)
+        .with_context(|| format!("failed to create `{}`", patch_jar.display()))?;
+    let mut writer = zip::ZipWriter::new(output);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file(INTEGRATED_SERVER_CLASS, options)
+        .with_context(|| format!("failed to write `{}`", patch_jar.display()))?;
+    writer
+        .write_all(&patched)
+        .with_context(|| format!("failed to write `{}`", patch_jar.display()))?;
+    writer
+        .finish()
+        .with_context(|| format!("failed to finish `{}`", patch_jar.display()))?;
+    Ok(Some(patch_jar))
+}
+
+fn patch_integrated_server_lan_auth(class: &[u8]) -> Result<Option<Vec<u8>>> {
+    let auth_methods = integrated_server_auth_method_refs(class)?;
+    if auth_methods.is_empty() {
+        return Ok(None);
+    }
+
+    let mut patched = class.to_vec();
+    let mut patches = 0;
+    for index in 0..patched.len().saturating_sub(4) {
+        if patched[index] == 0x2a && patched[index + 1] == 0x04 && patched[index + 2] == 0xb6 {
+            let method = u16::from_be_bytes([patched[index + 3], patched[index + 4]]);
+            if auth_methods.contains(&method) {
+                patched[index + 1] = 0x03;
+                patches += 1;
+            }
+        }
+    }
+
+    if patches == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(patched))
+    }
+}
+
+fn integrated_server_auth_method_refs(class: &[u8]) -> Result<Vec<u16>> {
+    if class.len() < 10 || &class[..4] != b"\xca\xfe\xba\xbe" {
+        bail!("class file is not valid");
+    }
+
+    let constant_pool_count = read_class_u16(class, 8)? as usize;
+    let mut utf8 = vec![None; constant_pool_count];
+    let mut name_and_type = vec![None; constant_pool_count];
+    let mut method_refs = vec![None; constant_pool_count];
+    let mut offset = 10;
+    let mut index = 1;
+    while index < constant_pool_count {
+        let tag = *class
+            .get(offset)
+            .with_context(|| format!("constant pool entry {index} is truncated"))?;
+        offset += 1;
+        match tag {
+            1 => {
+                let len = read_class_u16(class, offset)? as usize;
+                offset += 2;
+                if offset + len > class.len() {
+                    bail!("constant pool UTF-8 entry {index} is truncated");
+                }
+                utf8[index] = Some(
+                    String::from_utf8(class[offset..offset + len].to_vec())
+                        .context("constant pool UTF-8 entry is invalid")?,
+                );
+                offset += len;
+            }
+            3 | 4 | 17 | 18 => advance_class_offset(class, &mut offset, 4)?,
+            5 | 6 => {
+                advance_class_offset(class, &mut offset, 8)?;
+                index += 1;
+            }
+            7 | 8 | 16 | 19 | 20 => advance_class_offset(class, &mut offset, 2)?,
+            9..=11 => {
+                advance_class_offset(class, &mut offset, 2)?;
+                let descriptor = read_class_u16(class, offset)?;
+                offset += 2;
+                if tag == 10 {
+                    method_refs[index] = Some(descriptor);
+                }
+            }
+            12 => {
+                let name = read_class_u16(class, offset)?;
+                let descriptor = read_class_u16(class, offset + 2)?;
+                name_and_type[index] = Some((name, descriptor));
+                offset += 4;
+            }
+            15 => advance_class_offset(class, &mut offset, 3)?,
+            _ => bail!("unsupported constant pool tag {tag}"),
+        }
+        index += 1;
+    }
+
+    let mut refs = Vec::new();
+    for (index, descriptor) in method_refs.into_iter().enumerate() {
+        let Some(descriptor) = descriptor else {
+            continue;
+        };
+        let Some(Some((name, descriptor))) = name_and_type.get(descriptor as usize) else {
+            continue;
+        };
+        if utf8.get(*name as usize).and_then(|value| value.as_deref())
+            == Some("setUsesAuthentication")
+            && utf8
+                .get(*descriptor as usize)
+                .and_then(|value| value.as_deref())
+                == Some("(Z)V")
+        {
+            refs.push(index as u16);
+        }
+    }
+    Ok(refs)
+}
+
+fn read_class_u16(class: &[u8], offset: usize) -> Result<u16> {
+    if offset + 2 > class.len() {
+        bail!("class file is truncated");
+    }
+    Ok(u16::from_be_bytes([class[offset], class[offset + 1]]))
+}
+
+fn advance_class_offset(class: &[u8], offset: &mut usize, len: usize) -> Result<()> {
+    if *offset + len > class.len() {
+        bail!("class file is truncated");
+    }
+    *offset += len;
+    Ok(())
+}
+
 fn build_classpath(
     launcher_root: &Path,
     client_jar: &Path,
     libraries: &[MinecraftLibrary],
+    first_entry: Option<&Path>,
 ) -> Result<String> {
     let os = OperatingSystem::current()?;
     let mut classpath = Vec::new();
+    if let Some(first_entry) = first_entry {
+        classpath.push(first_entry.to_path_buf());
+    }
 
     for library in libraries {
         if !allowed_by_rules(library.rules.as_deref(), os) {
@@ -7180,6 +7356,32 @@ mod tests {
             + 1;
         assert_eq!(command.args[game_dir_index], path_to_string(&version_dir));
         assert!(version_dir.join(MODS_FOLDER_NAME).is_dir());
+    }
+
+    #[test]
+    fn patches_integrated_server_lan_auth_flag() {
+        let mut class = b"\xca\xfe\xba\xbe\0\0\0=\0\x07".to_vec();
+        push_test_utf8(&mut class, "setUsesAuthentication");
+        push_test_utf8(&mut class, "(Z)V");
+        class.extend_from_slice(&[12, 0, 1, 0, 2]);
+        class.extend_from_slice(&[7, 0, 5]);
+        push_test_utf8(&mut class, "net/minecraft/server/MinecraftServer");
+        class.extend_from_slice(&[10, 0, 4, 0, 3]);
+        let patch_offset = class.len();
+        class.extend_from_slice(&[0x2a, 0x04, 0xb6, 0, 6]);
+
+        let patched = patch_integrated_server_lan_auth(&class).unwrap().unwrap();
+
+        assert_eq!(
+            &patched[patch_offset..patch_offset + 5],
+            &[0x2a, 0x03, 0xb6, 0, 6]
+        );
+    }
+
+    fn push_test_utf8(class: &mut Vec<u8>, value: &str) {
+        class.push(1);
+        class.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        class.extend_from_slice(value.as_bytes());
     }
 
     #[test]
