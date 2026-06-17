@@ -21,11 +21,13 @@ pub const SOURCE_FOLDER: &str = env!("CLEAR_LAUNCHER_SOURCE_FOLDER");
 pub const CONFIG_FILE_NAME: &str = "config.yml";
 pub const MOD_CONFIG_FILE_NAME: &str = "mod.yml";
 pub const BUILD_FOLDER_NAME: &str = "build";
+pub const TEST_MINECRAFT_FOLDER_NAME: &str = ".minecraft";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const MODS_FOLDER_NAME: &str = "mods";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const DEFAULT_EDITOR: &str = "code";
 pub const DEFAULT_MOD_VERSION: &str = "1.0.0";
+pub const DEFAULT_TEST_USERNAME: &str = "Player";
 pub const FABRIC_LOADER_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/loader";
 pub const FABRIC_GAME_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/game";
 pub const FABRIC_YARN_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/yarn";
@@ -171,6 +173,7 @@ pub fn execute(
             install_mod_project(launcher_root, versions_folder, config, cwd, request)
         },
         |launcher_root, config, request| clone_mod_project(launcher_root, config, request),
+        |launcher_root, config, cwd, request| test_mod_project(launcher_root, config, cwd, request),
         current_exe_path,
     )
 }
@@ -194,6 +197,7 @@ fn execute_with_services(
         &InstallModRequest,
     ) -> Result<InstalledMod>,
     clone_mod: impl FnOnce(&Path, &LauncherConfig, &CloneModRequest) -> Result<ClonedMod>,
+    test_mod: impl FnOnce(&Path, &LauncherConfig, &Path, &TestModRequest) -> Result<TestedMod>,
     current_exe: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<()> {
     let mut args = args.into_iter();
@@ -556,6 +560,57 @@ fn execute_with_services(
                 ),
             )
         }
+        Some("test") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `test`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown test target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let test_request = parse_test_mod_request(args)?;
+
+            match test_request.name.as_deref() {
+                Some(name) => write_log(stderr, format_args!("Preparing test for mod `{name}`"))?,
+                None => write_log(stderr, format_args!("Preparing test for current mod"))?,
+            }
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            write_log(
+                stderr,
+                format_args!("Ensuring launcher path {}", launcher_root.display()),
+            )?;
+            ensure_launcher_root(&launcher_root)?;
+            let config_file = launcher_config_file(&launcher_root);
+            let config = load_launcher_config(&config_file)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Using my mods folder {}",
+                    config.configured_mods_folder(&launcher_root).display()
+                ),
+            )?;
+            write_log(
+                stderr,
+                format_args!("Using offline username `{DEFAULT_TEST_USERNAME}`"),
+            )?;
+            let tested = test_mod(&launcher_root, &config, cwd, &test_request)?;
+            write_tested_mod_output(&tested, stdout)?;
+            write_log(
+                stderr,
+                format_args!(
+                    "Finished testing mod `{}` in `{}`",
+                    tested.name,
+                    tested.launcher_root.display()
+                ),
+            )
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -661,6 +716,11 @@ pub struct CloneModRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestModRequest {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedMod {
     pub name: String,
     pub path: PathBuf,
@@ -690,6 +750,15 @@ pub struct ClonedMod {
     pub name: String,
     pub path: PathBuf,
     pub git_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestedMod {
+    pub name: String,
+    pub minecraft_version: String,
+    pub launcher_root: PathBuf,
+    pub jar: PathBuf,
+    pub destination: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -865,6 +934,19 @@ fn parse_clone_mod_request(
     }
     validate_git_url(&git_url)?;
     Ok(CloneModRequest { git_url })
+}
+
+fn parse_test_mod_request(mut args: impl Iterator<Item = String>) -> Result<TestModRequest> {
+    let mut name = None;
+
+    while let Some(arg) = args.next() {
+        if arg.starts_with("--") {
+            bail!("unexpected argument for `test mod`: `{arg}`");
+        }
+        set_optional_mod_name(&mut name, arg, "test mod")?;
+    }
+
+    Ok(TestModRequest { name })
 }
 
 fn set_version_bump(
@@ -2103,6 +2185,147 @@ fn clone_mod_project_with_services(
     result
 }
 
+pub fn test_mod_project(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    request: &TestModRequest,
+) -> Result<TestedMod> {
+    let mut builder = ProcessModBuilder;
+    let mut downloader = HttpDownloader::new();
+    let mut launcher = ProcessJavaLauncher;
+    test_mod_project_with_services(
+        launcher_root,
+        config,
+        cwd,
+        request,
+        &mut builder,
+        &mut downloader,
+        &mut launcher,
+    )
+}
+
+fn test_mod_project_with_services(
+    launcher_root: &Path,
+    config: &LauncherConfig,
+    cwd: &Path,
+    request: &TestModRequest,
+    builder: &mut impl ModBuilder,
+    downloader: &mut impl Downloader,
+    launcher: &mut impl JavaLauncher,
+) -> Result<TestedMod> {
+    let (mod_dir, mod_config) =
+        resolve_mod_project_for_request(launcher_root, config, cwd, request.name.as_deref())?;
+    let minecraft_version = mod_config
+        .minecraft_version
+        .as_deref()
+        .context("mod config `minecraft_version` is required to test a mod")?;
+    validate_version_token(minecraft_version, "mod config `minecraft_version`")?;
+
+    let jar = match existing_mod_build_jar(&mod_dir, &mod_config)? {
+        Some(jar) => jar,
+        None => {
+            let built = build_mod_project_with_services(
+                launcher_root,
+                config,
+                cwd,
+                &BuildModRequest {
+                    name: request.name.clone(),
+                    version_bump: VersionBump::None,
+                },
+                builder,
+            )?;
+            built.jar
+        }
+    };
+
+    ensure_local_minecraft_gitignored(&mod_dir)?;
+    let local_launcher_root = mod_dir.join(TEST_MINECRAFT_FOLDER_NAME);
+    let versions_folder = local_launcher_root.join(VERSIONS_FOLDER_NAME);
+    let installed = ensure_minecraft_version_with_downloader(
+        &local_launcher_root,
+        &versions_folder,
+        minecraft_version,
+        None,
+        downloader,
+    )?;
+    let version_dir = versions_folder
+        .join(&installed.id)
+        .join(DEFAULT_INSTALL_ALIAS);
+    let mods_dir = reset_version_mods_dir(&version_dir)?;
+    let file_name = jar
+        .file_name()
+        .context("built mod jar path does not include a file name")?;
+    let destination = mods_dir.join(file_name);
+    fs::copy(&jar, &destination).with_context(|| {
+        format!(
+            "failed to copy `{}` to `{}`",
+            jar.display(),
+            destination.display()
+        )
+    })?;
+
+    let run_request = RunRequest {
+        requested_version: installed.id.clone(),
+        alias: None,
+        username: DEFAULT_TEST_USERNAME.to_owned(),
+    };
+    let launched = run_minecraft_version_offline_with_services(
+        &local_launcher_root,
+        &versions_folder,
+        &run_request,
+        downloader,
+        launcher,
+    )?;
+
+    Ok(TestedMod {
+        name: mod_config.name,
+        minecraft_version: launched.id,
+        launcher_root: local_launcher_root,
+        jar,
+        destination,
+    })
+}
+
+fn ensure_local_minecraft_gitignored(mod_dir: &Path) -> Result<()> {
+    let gitignore = mod_dir.join(".gitignore");
+    let mut contents = match fs::read_to_string(&gitignore) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read `{}`", gitignore.display()));
+        }
+    };
+    if contents.lines().any(|line| {
+        let line = line.trim();
+        line == TEST_MINECRAFT_FOLDER_NAME || line == ".minecraft/"
+    }) {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(TEST_MINECRAFT_FOLDER_NAME);
+    contents.push_str("/\n");
+    fs::write(&gitignore, contents)
+        .with_context(|| format!("failed to write `{}`", gitignore.display()))
+}
+
+fn reset_version_mods_dir(version_dir: &Path) -> Result<PathBuf> {
+    let mods_dir = version_dir.join(MODS_FOLDER_NAME);
+    match fs::remove_dir_all(&mods_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to remove `{}`", mods_dir.display()));
+        }
+    }
+    fs::create_dir_all(&mods_dir)
+        .with_context(|| format!("failed to create `{}`", mods_dir.display()))?;
+    Ok(mods_dir)
+}
+
 fn available_clone_temp_dir(mods_folder: &Path) -> Result<PathBuf> {
     let process_id = std::process::id();
     for counter in 0..1000_u16 {
@@ -2835,6 +3058,41 @@ fn install_minecraft_version_with_downloader(
     alias: Option<&str>,
     downloader: &mut impl Downloader,
 ) -> Result<InstalledVersion> {
+    install_minecraft_version_with_downloader_mode(
+        launcher_root,
+        versions_folder,
+        requested_version,
+        alias,
+        downloader,
+        false,
+    )
+}
+
+fn ensure_minecraft_version_with_downloader(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    requested_version: &str,
+    alias: Option<&str>,
+    downloader: &mut impl Downloader,
+) -> Result<InstalledVersion> {
+    install_minecraft_version_with_downloader_mode(
+        launcher_root,
+        versions_folder,
+        requested_version,
+        alias,
+        downloader,
+        true,
+    )
+}
+
+fn install_minecraft_version_with_downloader_mode(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    requested_version: &str,
+    alias: Option<&str>,
+    downloader: &mut impl Downloader,
+    allow_existing: bool,
+) -> Result<InstalledVersion> {
     let manifest = downloader.download_string(MINECRAFT_VERSION_MANIFEST_URL)?;
     let manifest = parse_minecraft_version_manifest(&manifest)?;
     let selected = resolve_minecraft_version(&manifest, requested_version)?;
@@ -2849,6 +3107,12 @@ fn install_minecraft_version_with_downloader(
         .try_exists()
         .with_context(|| format!("failed to inspect `{}`", version_dir.display()))?
     {
+        if allow_existing {
+            return Ok(InstalledVersion {
+                id: version_id,
+                alias: alias.map(str::to_owned),
+            });
+        }
         bail!(
             "Minecraft version `{version_id}` with alias `{install_name}` is already installed at `{}`",
             version_dir.display()
@@ -3760,13 +4024,24 @@ fn write_cloned_mod_output(cloned: &ClonedMod, stdout: &mut impl Write) -> Resul
     .context("failed to write clone mod output")
 }
 
+fn write_tested_mod_output(tested: &TestedMod, stdout: &mut impl Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "Tested mod {} on Minecraft {} at {}",
+        tested.name,
+        tested.minecraft_version,
+        tested.launcher_root.display()
+    )
+    .context("failed to write test mod output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -3945,6 +4220,7 @@ mod tests {
             |_, _, _, _| unreachable!("versions command should not build mods"),
             |_, _, _, _, _| unreachable!("versions command should not install mods"),
             |_, _, _| unreachable!("versions command should not clone mods"),
+            |_, _, _, _| unreachable!("versions command should not test mods"),
             || unreachable!("versions command should not inspect the current executable"),
         )
         .unwrap();
@@ -4020,6 +4296,7 @@ mod tests {
             |_, _, _, _| unreachable!("create mod command should not build mods"),
             |_, _, _, _, _| unreachable!("create mod command should not install mods"),
             |_, _, _| unreachable!("create mod command should not clone mods"),
+            |_, _, _, _| unreachable!("create mod command should not test mods"),
             || unreachable!("create mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -4092,6 +4369,7 @@ mod tests {
             },
             |_, _, _, _, _| unreachable!("build mod command should not install mods"),
             |_, _, _| unreachable!("build mod command should not clone mods"),
+            |_, _, _, _| unreachable!("build mod command should not test mods"),
             || unreachable!("build mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -4159,6 +4437,7 @@ mod tests {
                 })
             },
             |_, _, _| unreachable!("install mod command should not clone mods"),
+            |_, _, _, _| unreachable!("install mod command should not test mods"),
             || unreachable!("install mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -4227,6 +4506,7 @@ mod tests {
                     git_url: request.git_url.clone(),
                 })
             },
+            |_, _, _, _| unreachable!("clone mod command should not test mods"),
             || unreachable!("clone mod command should not inspect the current executable"),
         )
         .unwrap();
@@ -4244,6 +4524,79 @@ mod tests {
         ));
         assert!(logs.contains("Using my mods folder"));
         assert!(logs.contains("Finished cloning mod `mod-yml-name`"));
+    }
+
+    #[test]
+    fn test_mod_command_uses_config_and_name() {
+        let repo = tempfile::tempdir().unwrap();
+        let cwd = repo.path().join("build").join("nested");
+        let home = repo.path().join("home");
+        let launcher_root = launcher_root_for_home(&home);
+        let mods_folder = repo.path().join("configured-mods");
+        let local_launcher_root = mods_folder.join("cool-blocks/.minecraft");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::write(
+            launcher_root.join(CONFIG_FILE_NAME),
+            format!("mods_folder: {}\n", mods_folder.display()),
+        )
+        .unwrap();
+
+        let env = test_env_for(&home, None);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        execute_with_services(
+            vec![
+                "test".to_owned(),
+                "mod".to_owned(),
+                "cool-blocks".to_owned(),
+            ],
+            &cwd,
+            &env,
+            &mut stdout,
+            &mut stderr,
+            || unreachable!("test mod command should not fetch Fabric versions"),
+            |_, _, _| unreachable!("test mod command should not install versions directly"),
+            |_, _, _| unreachable!("test mod command should not run versions directly"),
+            |_, _, _| unreachable!("test mod command should not create mods"),
+            |_, _, _, _| unreachable!("test mod command should not build mods directly"),
+            |_, _, _, _, _| unreachable!("test mod command should not install mods"),
+            |_, _, _| unreachable!("test mod command should not clone mods"),
+            |root, config, current_dir, request| {
+                assert_eq!(root, launcher_root.as_path());
+                assert_eq!(config.configured_mods_folder(root), mods_folder);
+                assert_eq!(current_dir, cwd.as_path());
+                assert_eq!(
+                    request,
+                    &TestModRequest {
+                        name: Some("cool-blocks".to_owned()),
+                    }
+                );
+                Ok(TestedMod {
+                    name: "cool-blocks".to_owned(),
+                    minecraft_version: "1.20.4".to_owned(),
+                    launcher_root: local_launcher_root.clone(),
+                    jar: mods_folder.join("cool-blocks/build/libs/cool-blocks-1.0.0.jar"),
+                    destination: local_launcher_root
+                        .join("versions/1.20.4/default/mods/cool-blocks-1.0.0.jar"),
+                })
+            },
+            || unreachable!("test mod command should not inspect the current executable"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Tested mod cool-blocks on Minecraft 1.20.4 at {}\n",
+                local_launcher_root.display()
+            )
+        );
+        let logs = String::from_utf8(stderr).unwrap();
+        assert!(logs.contains("Preparing test for mod `cool-blocks`"));
+        assert!(logs.contains("Using offline username `Player`"));
+        assert!(logs.contains("Finished testing mod `cool-blocks`"));
     }
 
     #[test]
@@ -4640,6 +4993,163 @@ mod tests {
     }
 
     #[test]
+    fn tests_current_mod_in_local_minecraft_with_only_that_mod() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let mod_dir = repo.path().join("standalone-mod");
+        let jar = mod_dir.join("build/libs/cool-blocks-1.0.0.jar");
+        let loader_versions_url = fabric_loader_versions_for_minecraft_url("1.20.4");
+        let fabric_profile_endpoint = fabric_profile_url("1.20.4", "0.19.3");
+        fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        fs::write(&jar, "mod jar").unwrap();
+        fs::write(
+            mod_dir.join(MOD_CONFIG_FILE_NAME),
+            "name: cool-blocks\nmod_id: cool-blocks\nminecraft_version: 1.20.4\nversion: 1.0.0\nbuild: build/libs/cool-blocks-1.0.0.jar\n",
+        )
+        .unwrap();
+
+        let mut builder = FakeModBuilder::default();
+        let mut downloader = FakeDownloader::new([
+            (
+                MINECRAFT_VERSION_MANIFEST_URL,
+                r#"
+{
+  "latest": {
+    "release": "1.20.4",
+    "snapshot": "23w13a_or_b"
+  },
+  "versions": [
+    {
+      "id": "1.20.4",
+      "type": "release",
+      "url": "https://example.test/1.20.4.json"
+    }
+  ]
+}
+"#,
+            ),
+            (
+                loader_versions_url.as_str(),
+                r#"
+[
+  {
+    "loader": {
+      "version": "0.19.3",
+      "stable": true
+    }
+  }
+]
+"#,
+            ),
+            (
+                "https://example.test/1.20.4.json",
+                r#"
+{
+  "type": "release",
+  "mainClass": "net.minecraft.client.main.Main",
+  "arguments": {
+    "jvm": [
+      "-cp",
+      "${classpath}"
+    ],
+    "game": [
+      "--username",
+      "${auth_player_name}",
+      "--gameDir",
+      "${game_directory}"
+    ]
+  },
+  "downloads": {
+    "client": {
+      "url": "https://example.test/client.jar"
+    }
+  },
+  "libraries": [
+    {
+      "downloads": {
+        "artifact": {
+          "path": "org/example/lib/1.0/lib-1.0.jar",
+          "url": "https://example.test/lib-1.0.jar"
+        }
+      }
+    }
+  ]
+}
+"#,
+            ),
+            (
+                fabric_profile_endpoint.as_str(),
+                r#"
+{
+  "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+  "arguments": {
+    "jvm": [],
+    "game": []
+  },
+  "libraries": [
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3",
+      "url": "https://maven.fabricmc.net/"
+    }
+  ]
+}
+"#,
+            ),
+        ]);
+        let mut launcher = FakeJavaLauncher::default();
+
+        let tested = test_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &mod_dir,
+            &TestModRequest { name: None },
+            &mut builder,
+            &mut downloader,
+            &mut launcher,
+        )
+        .unwrap();
+
+        let local_launcher_root = mod_dir.join(TEST_MINECRAFT_FOLDER_NAME);
+        let version_dir = local_launcher_root.join("versions/1.20.4/default");
+        let mods_dir = version_dir.join(MODS_FOLDER_NAME);
+        assert_eq!(tested.name, "cool-blocks");
+        assert_eq!(tested.launcher_root, local_launcher_root);
+        assert_eq!(
+            fs::read_to_string(mod_dir.join(".gitignore")).unwrap(),
+            ".minecraft/\n"
+        );
+        assert_eq!(fs::read(&tested.destination).unwrap(), b"mod jar");
+        assert_eq!(builder.build_dirs, Vec::<PathBuf>::new());
+
+        fs::write(mods_dir.join("other-mod-1.0.0.jar"), "other").unwrap();
+        let tested_again = test_mod_project_with_services(
+            &launcher_root,
+            &LauncherConfig::default(),
+            &mod_dir,
+            &TestModRequest { name: None },
+            &mut builder,
+            &mut downloader,
+            &mut launcher,
+        )
+        .unwrap();
+
+        assert_eq!(tested_again.destination, tested.destination);
+        let local_mods = fs::read_dir(&mods_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(local_mods, vec![tested.destination]);
+        let command = launcher.command.unwrap();
+        assert_eq!(command.current_dir, version_dir);
+        assert!(
+            command
+                .args
+                .contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_owned())
+        );
+        assert!(command.args.contains(&DEFAULT_TEST_USERNAME.to_owned()));
+    }
+
+    #[test]
     fn clones_mod_project_to_name_from_mod_config() {
         let repo = tempfile::tempdir().unwrap();
         let launcher_root = repo.path().join("launcher");
@@ -4836,6 +5346,7 @@ mod tests {
             |_, _, _, _| unreachable!("install command should not build mods"),
             |_, _, _, _, _| unreachable!("install command should not install mods"),
             |_, _, _| unreachable!("install command should not clone mods"),
+            |_, _, _, _| unreachable!("install command should not test mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -4892,6 +5403,7 @@ mod tests {
             |_, _, _, _| unreachable!("install command should not build mods"),
             |_, _, _, _, _| unreachable!("install command should not install mods"),
             |_, _, _| unreachable!("install command should not clone mods"),
+            |_, _, _, _| unreachable!("install command should not test mods"),
             || unreachable!("install command should not inspect the current executable"),
         )
         .unwrap();
@@ -4954,6 +5466,7 @@ mod tests {
             |_, _, _, _| unreachable!("run command should not build mods"),
             |_, _, _, _, _| unreachable!("run command should not install mods"),
             |_, _, _| unreachable!("run command should not clone mods"),
+            |_, _, _, _| unreachable!("run command should not test mods"),
             || unreachable!("run command should not inspect the current executable"),
         )
         .unwrap();
@@ -5156,6 +5669,7 @@ mod tests {
             |_, _, _, _| unreachable!("configure-path should not build mods"),
             |_, _, _, _, _| unreachable!("configure-path should not install mods"),
             |_, _, _| unreachable!("configure-path should not clone mods"),
+            |_, _, _, _| unreachable!("configure-path should not test mods"),
             || Ok(exe_path.clone()),
         )
         .unwrap();
@@ -5192,6 +5706,7 @@ mod tests {
             |_, _, _, _| unreachable!("unset-path should not build mods"),
             |_, _, _, _, _| unreachable!("unset-path should not install mods"),
             |_, _, _| unreachable!("unset-path should not clone mods"),
+            |_, _, _, _| unreachable!("unset-path should not test mods"),
             || unreachable!("unset-path should not inspect the current executable"),
         )
         .unwrap();

@@ -146,6 +146,14 @@ Installing a mod that is already installed on that **Version Folder** automatica
 
  Clones via git url a repository into `{My Mods Folder}/{name}`, if the folder already exists, abort. The name must be resolved from the mod.yml file and not from the repository name.  If the repository does not contains a valid mod.yml, abort.
 
+
+
+### 9. [Command] Testing Mods
+
+**Usage:** `{CLI Name} test mod [name]`
+
+Initializes a full local minecraft copy on the ./.minecraft relative to the mod folder (.gitignored), and run the minecraft game with only this specific mod attached, if name is not provided, use the cwd
+
 ## 6. CLI Style
 
 **Verbosity:** The CLI by default logs everything that it's doing
