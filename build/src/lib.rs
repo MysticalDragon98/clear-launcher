@@ -3187,8 +3187,11 @@ fn search_modrinth_mods(
     request: &SearchModRequest,
     downloader: &mut impl Downloader,
 ) -> Result<Vec<SearchedMod>> {
-    let minecraft_version =
-        resolve_installed_minecraft_version(versions_folder, request.version.as_deref())?;
+    let minecraft_version = resolve_installed_minecraft_version(
+        versions_folder,
+        request.version.as_deref(),
+        downloader,
+    )?;
     let facets = format!(r#"[["project_type:mod"],["versions:{minecraft_version}"]]"#);
     let url = format!(
         "{MODRINTH_SEARCH_URL}?query={}&limit=10&facets={}",
@@ -3216,11 +3219,20 @@ fn search_modrinth_mods(
 fn resolve_installed_minecraft_version(
     versions_folder: &Path,
     requested: Option<&str>,
+    downloader: &mut impl Downloader,
 ) -> Result<String> {
     if let Some(version) = requested {
         validate_version_token(version, "search version")?;
         if versions_folder.join(version).is_dir() {
             return Ok(version.to_owned());
+        }
+        if let Ok(manifest) = downloader
+            .download_string(MINECRAFT_VERSION_MANIFEST_URL)
+            .and_then(|manifest| parse_minecraft_version_manifest(&manifest))
+        {
+            if let Ok(version) = resolve_minecraft_version(&manifest, version) {
+                return Ok(version.id.clone());
+            }
         }
     }
 
@@ -5823,6 +5835,37 @@ mod tests {
             &SearchModRequest {
                 term: "iris".to_owned(),
                 version: Some("26.1.2".to_owned()),
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(mods[0].slug, "iris");
+    }
+
+    #[test]
+    fn searches_modrinth_for_latest_version_request() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        fs::create_dir_all(&versions_folder).unwrap();
+        let facets = percent_encode_query(r#"[["project_type:mod"],["versions:1.20.4"]]"#);
+        let url = format!("{MODRINTH_SEARCH_URL}?query=iris&limit=10&facets={facets}");
+        let mut downloader = FakeDownloader::new([
+            (
+                MINECRAFT_VERSION_MANIFEST_URL,
+                r#"{"latest":{"release":"1.20.4","snapshot":"24w01a"},"versions":[{"id":"1.20.4","type":"release","url":"https://example.test/1.20.4.json"}]}"#,
+            ),
+            (
+                url.as_str(),
+                r#"{"hits":[{"title":"Iris","slug":"iris","description":"Shaders"}]}"#,
+            ),
+        ]);
+
+        let mods = search_modrinth_mods(
+            &versions_folder,
+            &SearchModRequest {
+                term: "iris".to_owned(),
+                version: Some("latest".to_owned()),
             },
             &mut downloader,
         )
