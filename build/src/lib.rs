@@ -3215,9 +3215,16 @@ fn search_modrinth_mods(
 
 fn resolve_installed_minecraft_version(
     versions_folder: &Path,
-    alias: Option<&str>,
+    requested: Option<&str>,
 ) -> Result<String> {
-    let alias = alias.unwrap_or(DEFAULT_INSTALL_ALIAS);
+    if let Some(version) = requested {
+        validate_version_token(version, "search version")?;
+        if versions_folder.join(version).is_dir() {
+            return Ok(version.to_owned());
+        }
+    }
+
+    let alias = requested.unwrap_or(DEFAULT_INSTALL_ALIAS);
     validate_path_segment(alias, "search version")?;
 
     for entry in fs::read_dir(versions_folder)
@@ -3235,7 +3242,7 @@ fn resolve_installed_minecraft_version(
         }
     }
 
-    bail!("installed version alias `{alias}` was not found")
+    bail!("installed version or alias `{alias}` was not found")
 }
 
 fn percent_encode_query(value: &str) -> String {
@@ -5797,6 +5804,31 @@ mod tests {
                 description: "Fast renderer".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn searches_modrinth_for_installed_version_folder() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        fs::create_dir_all(versions_folder.join("26.1.2/default")).unwrap();
+        let facets = percent_encode_query(r#"[["project_type:mod"],["versions:26.1.2"]]"#);
+        let url = format!("{MODRINTH_SEARCH_URL}?query=iris&limit=10&facets={facets}");
+        let mut downloader = FakeDownloader::new([(
+            url.as_str(),
+            r#"{"hits":[{"title":"Iris","slug":"iris","description":"Shaders"}]}"#,
+        )]);
+
+        let mods = search_modrinth_mods(
+            &versions_folder,
+            &SearchModRequest {
+                term: "iris".to_owned(),
+                version: Some("26.1.2".to_owned()),
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(mods[0].slug, "iris");
     }
 
     #[test]
