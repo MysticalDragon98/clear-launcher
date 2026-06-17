@@ -27,7 +27,7 @@ pub const TEST_MINECRAFT_FOLDER_NAME: &str = ".minecraft";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const MODS_FOLDER_NAME: &str = "mods";
 pub const REMOTE_MANIFEST_FILE_NAME: &str = "remote.yml";
-const OFFLINE_LAN_PATCH_JAR_NAME: &str = ".clear-launcher-offline-lan.jar";
+const OFFLINE_LAN_CLIENT_JAR_NAME: &str = ".clear-launcher-offline-client.jar";
 const INTEGRATED_SERVER_CLASS: &str = "net/minecraft/client/server/IntegratedServer.class";
 pub const DEFAULT_OPEN_ADDRESS: &str = "0.0.0.0:7878";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
@@ -4022,13 +4022,8 @@ fn build_launch_command(
         );
     }
 
-    let offline_lan_patch_jar = ensure_offline_lan_patch_jar(version_dir, &client_jar)?;
-    let classpath = build_classpath(
-        launcher_root,
-        &client_jar,
-        &version_data.libraries,
-        offline_lan_patch_jar.as_deref(),
-    )?;
+    let client_jar = ensure_offline_lan_client_jar(version_dir, &client_jar)?;
+    let classpath = build_classpath(launcher_root, &client_jar, &version_data.libraries)?;
     let context = LaunchArgumentContext {
         launcher_root,
         version_dir,
@@ -4102,52 +4097,62 @@ fn game_launch_arguments(version_data: &MinecraftVersionData) -> Result<Vec<Stri
     bail!("installed Minecraft version does not include launch arguments");
 }
 
-fn ensure_offline_lan_patch_jar(version_dir: &Path, client_jar: &Path) -> Result<Option<PathBuf>> {
+fn ensure_offline_lan_client_jar(version_dir: &Path, client_jar: &Path) -> Result<PathBuf> {
     let file = fs::File::open(client_jar)
         .with_context(|| format!("failed to open `{}`", client_jar.display()))?;
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(archive) => archive,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(client_jar.to_path_buf()),
     };
-    let mut class_entry = match archive.by_name(INTEGRATED_SERVER_CLASS) {
-        Ok(class_entry) => class_entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to read `{INTEGRATED_SERVER_CLASS}` from `{}`",
-                    client_jar.display()
-                )
-            });
-        }
-    };
-    let mut class = Vec::new();
-    class_entry.read_to_end(&mut class).with_context(|| {
-        format!(
-            "failed to read `{INTEGRATED_SERVER_CLASS}` from `{}`",
-            client_jar.display()
-        )
-    })?;
+    if archive.by_name(INTEGRATED_SERVER_CLASS).is_err() {
+        return Ok(client_jar.to_path_buf());
+    }
 
-    let patched = patch_integrated_server_lan_auth(&class)?.with_context(|| {
-        format!("failed to patch `{INTEGRATED_SERVER_CLASS}` for offline LAN auth")
-    })?;
-    let patch_jar = version_dir.join(OFFLINE_LAN_PATCH_JAR_NAME);
-    let output = fs::File::create(&patch_jar)
-        .with_context(|| format!("failed to create `{}`", patch_jar.display()))?;
+    let patched_jar = version_dir.join(OFFLINE_LAN_CLIENT_JAR_NAME);
+    let output = fs::File::create(&patched_jar)
+        .with_context(|| format!("failed to create `{}`", patched_jar.display()))?;
     let mut writer = zip::ZipWriter::new(output);
-    let options =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    writer
-        .start_file(INTEGRATED_SERVER_CLASS, options)
-        .with_context(|| format!("failed to write `{}`", patch_jar.display()))?;
-    writer
-        .write_all(&patched)
-        .with_context(|| format!("failed to write `{}`", patch_jar.display()))?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).with_context(|| {
+            format!(
+                "failed to read entry {index} from `{}`",
+                client_jar.display()
+            )
+        })?;
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .last_modified_time(entry.last_modified());
+        if entry.is_dir() {
+            writer
+                .add_directory(entry.name(), options)
+                .with_context(|| format!("failed to write `{}`", patched_jar.display()))?;
+            continue;
+        }
+
+        let mut contents = Vec::new();
+        entry.read_to_end(&mut contents).with_context(|| {
+            format!(
+                "failed to read `{}` from `{}`",
+                entry.name(),
+                client_jar.display()
+            )
+        })?;
+        if entry.name() == INTEGRATED_SERVER_CLASS {
+            contents = patch_integrated_server_lan_auth(&contents)?.with_context(|| {
+                format!("failed to patch `{INTEGRATED_SERVER_CLASS}` for offline LAN auth")
+            })?;
+        }
+        writer
+            .start_file(entry.name(), options)
+            .with_context(|| format!("failed to write `{}`", patched_jar.display()))?;
+        writer
+            .write_all(&contents)
+            .with_context(|| format!("failed to write `{}`", patched_jar.display()))?;
+    }
     writer
         .finish()
-        .with_context(|| format!("failed to finish `{}`", patch_jar.display()))?;
-    Ok(Some(patch_jar))
+        .with_context(|| format!("failed to finish `{}`", patched_jar.display()))?;
+    Ok(patched_jar)
 }
 
 fn patch_integrated_server_lan_auth(class: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -4270,13 +4275,9 @@ fn build_classpath(
     launcher_root: &Path,
     client_jar: &Path,
     libraries: &[MinecraftLibrary],
-    first_entry: Option<&Path>,
 ) -> Result<String> {
     let os = OperatingSystem::current()?;
     let mut classpath = Vec::new();
-    if let Some(first_entry) = first_entry {
-        classpath.push(first_entry.to_path_buf());
-    }
 
     for library in libraries {
         if !allowed_by_rules(library.rules.as_deref(), os) {
