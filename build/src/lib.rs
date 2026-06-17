@@ -33,6 +33,7 @@ pub const FABRIC_GAME_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/version
 pub const FABRIC_YARN_VERSIONS_URL: &str = "https://meta.fabricmc.net/v2/versions/yarn";
 pub const FABRIC_LOOM_MAVEN_METADATA_URL: &str =
     "https://maven.fabricmc.net/net/fabricmc/fabric-loom/maven-metadata.xml";
+pub const FABRIC_MAVEN_URL: &str = "https://maven.fabricmc.net";
 pub const GRADLE_CURRENT_VERSION_URL: &str = "https://services.gradle.org/versions/current";
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
@@ -1999,6 +2000,7 @@ struct LoadedModConfig {
     name: String,
     mod_id: Option<String>,
     minecraft_version: Option<String>,
+    fabric_api_version: Option<String>,
     version: Option<String>,
     build: Option<PathBuf>,
     document: YamlValue,
@@ -2253,6 +2255,9 @@ fn test_mod_project_with_services(
         .join(&installed.id)
         .join(DEFAULT_INSTALL_ALIAS);
     let mods_dir = reset_version_mods_dir(&version_dir)?;
+    if let Some(fabric_api_version) = mod_config.fabric_api_version.as_deref() {
+        install_fabric_api_mod(&mods_dir, fabric_api_version, downloader)?;
+    }
     let file_name = jar
         .file_name()
         .context("built mod jar path does not include a file name")?;
@@ -2326,6 +2331,23 @@ fn reset_version_mods_dir(version_dir: &Path) -> Result<PathBuf> {
     Ok(mods_dir)
 }
 
+fn install_fabric_api_mod(
+    mods_dir: &Path,
+    fabric_api_version: &str,
+    downloader: &mut impl Downloader,
+) -> Result<PathBuf> {
+    let artifact_path = maven_artifact_path(&format!(
+        "net.fabricmc.fabric-api:fabric-api:{fabric_api_version}"
+    ))?;
+    let file_name = Path::new(&artifact_path)
+        .file_name()
+        .context("Fabric API artifact path does not include a file name")?;
+    let destination = mods_dir.join(file_name);
+    let url = format!("{FABRIC_MAVEN_URL}/{artifact_path}");
+    downloader.download_to_path(&url, &destination)?;
+    Ok(destination)
+}
+
 fn available_clone_temp_dir(mods_folder: &Path) -> Result<PathBuf> {
     let process_id = std::process::id();
     for counter in 0..1000_u16 {
@@ -2385,7 +2407,7 @@ fn load_mod_config_from_dir(mod_dir: &Path) -> Result<LoadedModConfig> {
 
     let document: YamlValue = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse `{}`", config_file.display()))?;
-    let (name, mod_id, minecraft_version, version, build) = {
+    let (name, mod_id, minecraft_version, fabric_api_version, version, build) = {
         let mapping = document
             .as_mapping()
             .with_context(|| format!("`{}` must contain a YAML mapping", config_file.display()))?;
@@ -2396,10 +2418,22 @@ fn load_mod_config_from_dir(mod_dir: &Path) -> Result<LoadedModConfig> {
             "minecraft_version",
             "mod config `minecraft_version`",
         )?;
+        let fabric_api_version = optional_yaml_string(
+            mapping,
+            "fabric_api_version",
+            "mod config `fabric_api_version`",
+        )?;
         let version = optional_yaml_string(mapping, "version", "mod config `version`")?;
         let build =
             optional_yaml_string(mapping, "build", "mod config `build`")?.map(PathBuf::from);
-        (name, mod_id, minecraft_version, version, build)
+        (
+            name,
+            mod_id,
+            minecraft_version,
+            fabric_api_version,
+            version,
+            build,
+        )
     };
 
     validate_path_segment(&name, "mod name")?;
@@ -2408,6 +2442,9 @@ fn load_mod_config_from_dir(mod_dir: &Path) -> Result<LoadedModConfig> {
     }
     if let Some(minecraft_version) = minecraft_version.as_deref() {
         validate_version_token(minecraft_version, "mod config `minecraft_version`")?;
+    }
+    if let Some(fabric_api_version) = fabric_api_version.as_deref() {
+        validate_version_token(fabric_api_version, "mod config `fabric_api_version`")?;
     }
     if let Some(version) = version.as_deref() {
         validate_version_token(version, "mod config `version`")?;
@@ -2422,6 +2459,7 @@ fn load_mod_config_from_dir(mod_dir: &Path) -> Result<LoadedModConfig> {
         name,
         mod_id,
         minecraft_version,
+        fabric_api_version,
         version,
         build,
         document,
@@ -2755,7 +2793,15 @@ fn run_minecraft_version_offline_with_services(
             version_dir.display()
         );
     }
-    ensure_version_mods_dir(&version_dir)?;
+    let mods_dir = ensure_version_mods_dir(&version_dir)?;
+    ensure_installed_profile_loads_fabric_if_needed(
+        launcher_root,
+        &version_dir,
+        &version_id,
+        install_name,
+        &mods_dir,
+        downloader,
+    )?;
 
     let command = build_launch_command(
         launcher_root,
@@ -2771,6 +2817,70 @@ fn run_minecraft_version_offline_with_services(
         alias: request.alias.clone(),
         username: request.username.clone(),
     })
+}
+
+fn ensure_installed_profile_loads_fabric_if_needed(
+    launcher_root: &Path,
+    version_dir: &Path,
+    version_id: &str,
+    install_name: &str,
+    mods_dir: &Path,
+    downloader: &mut impl Downloader,
+) -> Result<()> {
+    if !mods_dir_contains_jars(mods_dir)? {
+        return Ok(());
+    }
+
+    let version_json_path = version_dir.join(format!("{install_name}.json"));
+    let version_json = fs::read_to_string(&version_json_path)
+        .with_context(|| format!("failed to read `{}`", version_json_path.display()))?;
+    let version_data = parse_minecraft_version_data(&version_json)?;
+    if version_data_uses_fabric_loader(&version_data) {
+        return Ok(());
+    }
+
+    let fabric_loader_version = resolve_fabric_loader_version(downloader, version_id)?;
+    let fabric_profile_url = fabric_profile_url(version_id, &fabric_loader_version);
+    let fabric_profile_json = downloader.download_string(&fabric_profile_url)?;
+    let fabric_libraries = fabric_profile_libraries(&fabric_profile_json)?;
+    install_libraries(launcher_root, version_dir, fabric_libraries, downloader)?;
+
+    let upgraded_version_json =
+        merge_minecraft_and_fabric_version_data(&version_json, &fabric_profile_json)?;
+    fs::write(&version_json_path, upgraded_version_json).with_context(|| {
+        format!("failed to upgrade installed Minecraft version `{version_id}` with Fabric loader")
+    })
+}
+
+fn mods_dir_contains_jars(mods_dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(mods_dir)
+        .with_context(|| format!("failed to read `{}`", mods_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", mods_dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && path_has_extension(&path, "jar") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn version_data_uses_fabric_loader(version_data: &MinecraftVersionData) -> bool {
+    version_data
+        .main_class
+        .as_deref()
+        .is_some_and(|main_class| main_class.starts_with("net.fabricmc.loader."))
+}
+
+fn fabric_profile_libraries(fabric_profile: &str) -> Result<Vec<MinecraftLibrary>> {
+    let fabric: Value =
+        serde_json::from_str(fabric_profile).context("failed to parse Fabric loader profile")?;
+    let Some(libraries) = fabric.get("libraries") else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(libraries.clone())
+        .context("failed to parse Fabric loader profile libraries")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5004,7 +5114,7 @@ mod tests {
         fs::write(&jar, "mod jar").unwrap();
         fs::write(
             mod_dir.join(MOD_CONFIG_FILE_NAME),
-            "name: cool-blocks\nmod_id: cool-blocks\nminecraft_version: 1.20.4\nversion: 1.0.0\nbuild: build/libs/cool-blocks-1.0.0.jar\n",
+            "name: cool-blocks\nmod_id: cool-blocks\nminecraft_version: 1.20.4\nfabric_api_version: 0.99.0+1.20.4\nversion: 1.0.0\nbuild: build/libs/cool-blocks-1.0.0.jar\n",
         )
         .unwrap();
 
@@ -5134,11 +5244,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(tested_again.destination, tested.destination);
-        let local_mods = fs::read_dir(&mods_dir)
+        let mut local_mods = fs::read_dir(&mods_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert_eq!(local_mods, vec![tested.destination]);
+        local_mods.sort();
+        assert_eq!(
+            local_mods,
+            vec![
+                mods_dir.join("cool-blocks-1.0.0.jar"),
+                mods_dir.join("fabric-api-0.99.0+1.20.4.jar"),
+            ]
+        );
         let command = launcher.command.unwrap();
         assert_eq!(command.current_dir, version_dir);
         assert!(
@@ -5632,6 +5749,168 @@ mod tests {
             + 1;
         assert_eq!(command.args[game_dir_index], path_to_string(&version_dir));
         assert!(version_dir.join(MODS_FOLDER_NAME).is_dir());
+    }
+
+    #[test]
+    fn run_upgrades_legacy_vanilla_profile_with_installed_mods_to_fabric() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        let version_dir = versions_folder.join("1.20.4/default");
+        let mods_dir = version_dir.join(MODS_FOLDER_NAME);
+        let library_path = launcher_root.join("libraries/org/example/lib/1.0/lib-1.0.jar");
+        let loader_versions_url = fabric_loader_versions_for_minecraft_url("1.20.4");
+        let fabric_profile_endpoint = fabric_profile_url("1.20.4", "0.19.3");
+        fs::create_dir_all(&mods_dir).unwrap();
+        fs::create_dir_all(library_path.parent().unwrap()).unwrap();
+        fs::write(version_dir.join("default.jar"), "client").unwrap();
+        fs::write(&library_path, "library").unwrap();
+        fs::write(mods_dir.join("day-counter-1.0.0.jar"), "mod").unwrap();
+        fs::write(
+            version_dir.join("default.json"),
+            r#"
+{
+  "type": "release",
+  "mainClass": "net.minecraft.client.main.Main",
+  "arguments": {
+    "jvm": [
+      "-Djava.library.path=${natives_directory}",
+      "-cp",
+      "${classpath}"
+    ],
+    "game": [
+      "--username",
+      "${auth_player_name}",
+      "--gameDir",
+      "${game_directory}"
+    ]
+  },
+  "downloads": {
+    "client": {
+      "url": "https://example.test/client.jar"
+    }
+  },
+  "libraries": [
+    {
+      "downloads": {
+        "artifact": {
+          "path": "org/example/lib/1.0/lib-1.0.jar",
+          "url": "https://example.test/lib-1.0.jar"
+        }
+      }
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let mut downloader = FakeDownloader::new([
+            (
+                MINECRAFT_VERSION_MANIFEST_URL,
+                r#"
+{
+  "latest": {
+    "release": "1.20.4",
+    "snapshot": "23w13a_or_b"
+  },
+  "versions": [
+    {
+      "id": "1.20.4",
+      "type": "release",
+      "url": "https://example.test/1.20.4.json"
+    }
+  ]
+}
+"#,
+            ),
+            (
+                loader_versions_url.as_str(),
+                r#"
+[
+  {
+    "loader": {
+      "version": "0.19.3",
+      "stable": true
+    }
+  }
+]
+"#,
+            ),
+            (
+                fabric_profile_endpoint.as_str(),
+                r#"
+{
+  "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+  "arguments": {
+    "jvm": [
+      "-DFabricMcEmu= net.minecraft.client.main.Main "
+    ],
+    "game": []
+  },
+  "libraries": [
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3",
+      "url": "https://maven.fabricmc.net/"
+    }
+  ]
+}
+"#,
+            ),
+        ]);
+        let mut launcher = FakeJavaLauncher::default();
+        let request = RunRequest {
+            requested_version: "latest".to_owned(),
+            alias: None,
+            username: "Player_1".to_owned(),
+        };
+
+        run_minecraft_version_offline_with_services(
+            &launcher_root,
+            &versions_folder,
+            &request,
+            &mut downloader,
+            &mut launcher,
+        )
+        .unwrap();
+
+        let installed_data: Value =
+            serde_json::from_str(&fs::read_to_string(version_dir.join("default.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            installed_data.get("mainClass").and_then(Value::as_str),
+            Some("net.fabricmc.loader.impl.launch.knot.KnotClient")
+        );
+        assert!(
+            installed_data
+                .get("libraries")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|library| library.get("name").and_then(Value::as_str)
+                    == Some("net.fabricmc:fabric-loader:0.19.3"))
+        );
+        assert_eq!(
+            fs::read(
+                launcher_root
+                    .join("libraries/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar")
+            )
+            .unwrap(),
+            b"https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar"
+        );
+        let command = launcher.command.unwrap();
+        assert!(
+            command
+                .args
+                .contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_owned())
+        );
+        let classpath_index = command
+            .args
+            .iter()
+            .position(|argument| argument == "-cp")
+            .unwrap()
+            + 1;
+        assert!(command.args[classpath_index].contains("fabric-loader-0.19.3.jar"));
     }
 
     #[cfg(unix)]
