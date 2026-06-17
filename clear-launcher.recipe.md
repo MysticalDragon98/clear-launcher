@@ -215,7 +215,7 @@ It must always update the version on the **Version Manifest File**
 
 Initializes a full local minecraft copy on the ./.minecraft relative to the mod folder (.gitignored), and run the minecraft game with only this specific mod attached, if name is not provided, use the cwd
 
-### 10. [Command] Searching Mods
+### 10. [Command] Searching Modrinth Mods
 
 **Usage:** {CLI Name} search mod {term} [--version {version-name}]
 
@@ -223,9 +223,9 @@ Searches mod via a term via **Modrinth API** related to a version, if no version
 
 
 
-### 10. [Command] Searching Mods
+### 10. [Command] Downloading Modrinth Mods
 
-**Usage:** {CLI Name} search mod {mod-name} [--version {version-name}]
+**Usage:** {CLI Name} download mod {mod-name} [--version {version-name}]
 
 Installs a mod via a term via **Modrinth API** related to a version, if no version is provided, use the `default` one.
 

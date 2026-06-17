@@ -42,6 +42,7 @@ pub const GRADLE_CURRENT_VERSION_URL: &str = "https://services.gradle.org/versio
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
 pub const MODRINTH_SEARCH_URL: &str = "https://api.modrinth.com/v2/search";
+pub const MODRINTH_PROJECT_URL: &str = "https://api.modrinth.com/v2/project";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledSettings {
@@ -668,6 +669,42 @@ fn execute_with_services(
             write_searched_mods_output(&mods, stdout)?;
             write_log(stderr, format_args!("Finished searching Modrinth"))
         }
+        Some("download") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `download`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown download target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let mod_name = args.next().with_context(|| {
+                format!(
+                    "missing mod name for `download mod`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            let download_request = parse_download_mod_request(mod_name, args)?;
+
+            write_log(
+                stderr,
+                format_args!("Downloading Modrinth mod `{}`", download_request.term),
+            )?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            ensure_launcher_root(&launcher_root)?;
+            let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            let mut downloader = HttpDownloader::new();
+            let downloaded =
+                download_modrinth_mod(&versions_folder, &download_request, &mut downloader)?;
+            write_downloaded_mod_output(&downloaded, stdout)?;
+            write_log(stderr, format_args!("Finished downloading Modrinth mod"))
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -832,6 +869,14 @@ pub struct SearchedMod {
     pub title: String,
     pub slug: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedMod {
+    pub name: String,
+    pub minecraft_version: String,
+    pub alias: String,
+    pub destination: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1094,6 +1139,16 @@ fn parse_search_mod_request(
     }
 
     Ok(SearchModRequest { term, version })
+}
+
+fn parse_download_mod_request(
+    term: String,
+    args: impl Iterator<Item = String>,
+) -> Result<SearchModRequest> {
+    if term.trim().is_empty() {
+        bail!("mod name cannot be empty");
+    }
+    parse_search_mod_request(term, args)
 }
 
 fn set_version_bump(
@@ -3216,6 +3271,99 @@ fn search_modrinth_mods(
         .collect())
 }
 
+fn download_modrinth_mod(
+    versions_folder: &Path,
+    request: &SearchModRequest,
+    downloader: &mut impl Downloader,
+) -> Result<DownloadedMod> {
+    let target = resolve_installed_minecraft_target(
+        versions_folder,
+        request.version.as_deref(),
+        downloader,
+    )?;
+    let versions_url = format!(
+        "{MODRINTH_PROJECT_URL}/{}/version?loaders={}&game_versions={}",
+        percent_encode_query(&request.term),
+        percent_encode_query(r#"["fabric"]"#),
+        percent_encode_query(&format!(r#"["{}"]"#, target.minecraft_version))
+    );
+    let versions: Vec<ModrinthVersion> = serde_json::from_str(
+        &downloader
+            .download_string(&versions_url)
+            .with_context(|| format!("failed to resolve Modrinth mod `{}`", request.term))?,
+    )
+    .context("failed to parse Modrinth version response")?;
+    let files: Vec<ModrinthFile> = versions
+        .into_iter()
+        .flat_map(|version| version.files)
+        .filter(|file| path_has_extension(Path::new(&file.filename), "jar"))
+        .collect();
+    let file = files
+        .iter()
+        .find(|file| file.primary)
+        .or_else(|| files.first())
+        .context("Modrinth response did not include a jar file")?;
+    validate_path_segment(&file.filename, "Modrinth file name")?;
+
+    let mods_dir = ensure_version_mods_dir(&target.version_dir)?;
+    let destination = mods_dir.join(&file.filename);
+    downloader.download_to_path(&file.url, &destination)?;
+    write_remote_version_manifest(
+        &target.version_dir,
+        &target.alias,
+        &target.minecraft_version,
+        &target.alias,
+        &mods_dir,
+    )?;
+
+    Ok(DownloadedMod {
+        name: request.term.clone(),
+        minecraft_version: target.minecraft_version,
+        alias: target.alias,
+        destination,
+    })
+}
+
+struct InstalledMinecraftTarget {
+    minecraft_version: String,
+    alias: String,
+    version_dir: PathBuf,
+}
+
+fn resolve_installed_minecraft_target(
+    versions_folder: &Path,
+    requested: Option<&str>,
+    downloader: &mut impl Downloader,
+) -> Result<InstalledMinecraftTarget> {
+    let minecraft_version =
+        resolve_installed_minecraft_version(versions_folder, requested, downloader)?;
+    let alias = requested.unwrap_or(DEFAULT_INSTALL_ALIAS);
+    let requested_dir = versions_folder.join(&minecraft_version).join(alias);
+    if requested_dir.is_dir() {
+        return Ok(InstalledMinecraftTarget {
+            minecraft_version,
+            alias: alias.to_owned(),
+            version_dir: requested_dir,
+        });
+    }
+
+    let default_dir = versions_folder
+        .join(&minecraft_version)
+        .join(DEFAULT_INSTALL_ALIAS);
+    if default_dir.is_dir() {
+        return Ok(InstalledMinecraftTarget {
+            minecraft_version,
+            alias: DEFAULT_INSTALL_ALIAS.to_owned(),
+            version_dir: default_dir,
+        });
+    }
+
+    bail!(
+        "Minecraft version `{minecraft_version}` with alias `{alias}` is not installed at `{}`",
+        requested_dir.display()
+    )
+}
+
 fn resolve_installed_minecraft_version(
     versions_folder: &Path,
     requested: Option<&str>,
@@ -3280,6 +3428,19 @@ struct ModrinthSearchHit {
     title: String,
     slug: String,
     description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthVersion {
+    files: Vec<ModrinthFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthFile {
+    filename: String,
+    url: String,
+    #[serde(default)]
+    primary: bool,
 }
 
 // ponytail: MD5 is only a local change detector; use SHA-256 if this becomes a trust boundary.
@@ -4817,13 +4978,25 @@ fn write_searched_mods_output(mods: &[SearchedMod], stdout: &mut impl Write) -> 
     Ok(())
 }
 
+fn write_downloaded_mod_output(downloaded: &DownloadedMod, stdout: &mut impl Write) -> Result<()> {
+    writeln!(
+        stdout,
+        "Downloaded {} for Minecraft {} ({}) to {}",
+        downloaded.name,
+        downloaded.minecraft_version,
+        downloaded.alias,
+        downloaded.destination.display()
+    )
+    .context("failed to write downloaded mod output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} search mod {{term}} [--version {{version-name}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} search mod {{term}} [--version {{version-name}}]\n       {cli_name} download mod {{mod-name}} [--version {{version-name}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -5872,6 +6045,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(mods[0].slug, "iris");
+    }
+
+    #[test]
+    fn downloads_modrinth_mod_for_installed_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        let version_dir = versions_folder.join("1.20.4/default");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(
+            version_dir.join("default.json"),
+            r#"{"downloads":{},"libraries":[{"name":"net.fabricmc:fabric-loader:0.19.3"}]}"#,
+        )
+        .unwrap();
+        let versions_url = format!(
+            "{MODRINTH_PROJECT_URL}/sodium/version?loaders={}&game_versions={}",
+            percent_encode_query(r#"["fabric"]"#),
+            percent_encode_query(r#"["1.20.4"]"#)
+        );
+        let mut downloader = FakeDownloader::new([
+            (
+                versions_url.as_str(),
+                r#"[{"files":[{"filename":"sodium.jar","url":"https://example.test/sodium.jar","primary":true}]}]"#,
+            ),
+            ("https://example.test/sodium.jar", "fake jar"),
+        ]);
+
+        let downloaded = download_modrinth_mod(
+            &versions_folder,
+            &SearchModRequest {
+                term: "sodium".to_owned(),
+                version: None,
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(downloaded.destination, version_dir.join("mods/sodium.jar"));
+        assert_eq!(fs::read(&downloaded.destination).unwrap(), b"fake jar");
+        let manifest: RemoteVersionManifest =
+            serde_yaml::from_str(&fs::read_to_string(version_dir.join("remote.yml")).unwrap())
+                .unwrap();
+        assert!(manifest.mods.contains_key("sodium.jar"));
     }
 
     #[test]
