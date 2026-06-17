@@ -4058,10 +4058,11 @@ fn build_launch_command(
     }
 
     let game_templates = game_launch_arguments(&version_data)?;
-    let game_args = game_templates
+    let mut game_args = game_templates
         .iter()
         .map(|argument| substitute_launch_argument(argument, &context))
         .collect::<Vec<_>>();
+    game_args.push("--offlineDeveloperMode".to_owned());
 
     let mut args = Vec::with_capacity(jvm_args.len() + 1 + game_args.len());
     args.extend(jvm_args);
@@ -7160,6 +7161,7 @@ mod tests {
         assert_eq!(command.args[access_token_index], "");
         assert!(!command.args.contains(&"0".to_owned()));
         assert!(command.args.contains(&"legacy".to_owned()));
+        assert!(command.args.contains(&"--offlineDeveloperMode".to_owned()));
         assert!(!command.args.contains(&"--demo".to_owned()));
         let classpath_index = command
             .args
