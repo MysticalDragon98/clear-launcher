@@ -4,13 +4,15 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use serde_yaml::{Mapping, Value as YamlValue};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 pub const DEFAULT_CLI_NAME: &str = env!("CLEAR_LAUNCHER_CLI_NAME");
@@ -24,6 +26,8 @@ pub const BUILD_FOLDER_NAME: &str = "build";
 pub const TEST_MINECRAFT_FOLDER_NAME: &str = ".minecraft";
 pub const VERSIONS_FOLDER_NAME: &str = "versions";
 pub const MODS_FOLDER_NAME: &str = "mods";
+pub const REMOTE_MANIFEST_FILE_NAME: &str = "remote.yml";
+pub const DEFAULT_OPEN_ADDRESS: &str = "0.0.0.0:7878";
 pub const DEFAULT_INSTALL_ALIAS: &str = "default";
 pub const DEFAULT_EDITOR: &str = "code";
 pub const DEFAULT_MOD_VERSION: &str = "1.0.0";
@@ -329,23 +333,39 @@ fn execute_with_services(
             )
         }
         Some("run") => {
-            let requested_version = args.next().with_context(|| {
+            let first = args.next().with_context(|| {
                 format!(
-                    "missing version for `run`\n\n{}",
+                    "missing version or `--connect` for `run`\n\n{}",
                     usage_text(DEFAULT_CLI_NAME)
                 )
             })?;
-            let run_request = parse_run_request(requested_version, args)?;
+            let run_request = parse_run_request(first, args)?;
 
-            write_log(
-                stderr,
-                format_args!(
-                    "Preparing run for requested Minecraft version `{}`",
-                    run_request.requested_version
-                ),
-            )?;
+            if let Some(host) = run_request.connect.as_deref() {
+                write_log(
+                    stderr,
+                    format_args!(
+                        "Preparing remote run from `{host}` as `{}`",
+                        run_request.name.as_deref().unwrap_or(DEFAULT_INSTALL_ALIAS)
+                    ),
+                )?;
+            } else {
+                write_log(
+                    stderr,
+                    format_args!(
+                        "Preparing run for requested Minecraft version `{}`",
+                        run_request
+                            .requested_version
+                            .as_deref()
+                            .context("missing version for local run")?
+                    ),
+                )?;
+            }
             if let Some(alias) = run_request.alias.as_deref() {
                 write_log(stderr, format_args!("Using run alias `{alias}`"))?;
+            }
+            if let Some(open) = run_request.open.as_deref() {
+                write_log(stderr, format_args!("Opening remote server on `{open}`"))?;
             }
             write_log(
                 stderr,
@@ -680,8 +700,11 @@ pub struct InstallRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
-    pub requested_version: String,
+    pub requested_version: Option<String>,
+    pub connect: Option<String>,
+    pub name: Option<String>,
     pub alias: Option<String>,
+    pub open: Option<String>,
     pub username: String,
 }
 
@@ -813,15 +836,36 @@ fn parse_install_request(
     })
 }
 
-fn parse_run_request(
-    requested_version: String,
-    mut args: impl Iterator<Item = String>,
-) -> Result<RunRequest> {
+fn parse_run_request(first: String, args: impl Iterator<Item = String>) -> Result<RunRequest> {
+    let mut requested_version = None;
+    let mut connect = None;
+    let mut name = None;
     let mut alias = None;
+    let mut open = None;
     let mut username = None;
+    let mut args = std::iter::once(first).chain(args).peekable();
 
     while let Some(arg) = args.next() {
-        if arg == "--alias" {
+        if arg == "--connect" {
+            let value = args
+                .next()
+                .context("missing value for `--connect` in `run`")?;
+            set_run_host(&mut connect, value, "--connect")?;
+        } else if let Some(value) = arg.strip_prefix("--connect=") {
+            set_run_host(&mut connect, value.to_owned(), "--connect")?;
+        } else if arg == "--name" {
+            let value = args.next().context("missing value for `--name` in `run`")?;
+            set_run_name(&mut name, value)?;
+        } else if let Some(value) = arg.strip_prefix("--name=") {
+            set_run_name(&mut name, value.to_owned())?;
+        } else if arg == "--open" {
+            let value = args
+                .next_if(|value| !value.starts_with("--"))
+                .unwrap_or_else(|| DEFAULT_OPEN_ADDRESS.to_owned());
+            set_run_host(&mut open, normalize_socket_address(&value), "--open")?;
+        } else if let Some(value) = arg.strip_prefix("--open=") {
+            set_run_host(&mut open, normalize_socket_address(value), "--open")?;
+        } else if arg == "--alias" {
             let value = args
                 .next()
                 .context("missing value for `--alias` in `run`")?;
@@ -835,16 +879,44 @@ fn parse_run_request(
             set_run_username(&mut username, value)?;
         } else if let Some(value) = arg.strip_prefix("--username=") {
             set_run_username(&mut username, value.to_owned())?;
-        } else {
+        } else if arg.starts_with("--") {
             bail!("unexpected argument for `run`: `{arg}`");
+        } else if requested_version.is_some() {
+            bail!("run version was provided more than once");
+        } else {
+            validate_version_token(&arg, "run version")?;
+            requested_version = Some(arg);
         }
     }
 
     let username = username.context("missing required `--username` for `run`")?;
+    if connect.is_some() || name.is_some() {
+        if requested_version.is_some() {
+            bail!("remote run cannot also provide a local version");
+        }
+        if open.is_some() {
+            bail!("remote mode is incompatible with `--open`");
+        }
+        if alias.is_some() {
+            bail!("remote mode uses `--name`; `--alias` is only for local runs");
+        }
+        connect
+            .as_ref()
+            .context("missing required `--connect` for remote `run`")?;
+        name.as_ref()
+            .context("missing required `--name` for remote `run`")?;
+    } else {
+        requested_version
+            .as_ref()
+            .context("missing version for local `run`")?;
+    }
 
     Ok(RunRequest {
         requested_version,
+        connect,
+        name,
         alias,
+        open,
         username,
     })
 }
@@ -997,6 +1069,24 @@ fn set_run_username(username: &mut Option<String>, value: String) -> Result<()> 
     }
     validate_username(&value)?;
     *username = Some(value);
+    Ok(())
+}
+
+fn set_run_name(name: &mut Option<String>, value: String) -> Result<()> {
+    if name.is_some() {
+        bail!("`--name` was provided more than once");
+    }
+    validate_path_segment(&value, "remote run name")?;
+    *name = Some(value);
+    Ok(())
+}
+
+fn set_run_host(slot: &mut Option<String>, value: String, flag: &str) -> Result<()> {
+    if slot.is_some() {
+        bail!("`{flag}` was provided more than once");
+    }
+    validate_host_value(&value, flag)?;
+    *slot = Some(value);
     Ok(())
 }
 
@@ -2271,8 +2361,11 @@ fn test_mod_project_with_services(
     })?;
 
     let run_request = RunRequest {
-        requested_version: installed.id.clone(),
+        requested_version: Some(installed.id.clone()),
+        connect: None,
+        name: None,
         alias: None,
+        open: None,
         username: DEFAULT_TEST_USERNAME.to_owned(),
     };
     let launched = run_minecraft_version_offline_with_services(
@@ -2747,6 +2840,14 @@ pub struct LaunchedVersion {
     pub username: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemoteVersionManifest {
+    name: String,
+    version: String,
+    fabric: String,
+    mods: BTreeMap<String, String>,
+}
+
 pub fn run_minecraft_version_offline(
     launcher_root: &Path,
     versions_folder: &Path,
@@ -2771,13 +2872,26 @@ fn run_minecraft_version_offline_with_services(
     launcher: &mut impl JavaLauncher,
 ) -> Result<LaunchedVersion> {
     validate_username(&request.username)?;
+    if request.connect.is_some() {
+        return run_minecraft_version_remote_with_services(
+            launcher_root,
+            versions_folder,
+            request,
+            downloader,
+            launcher,
+        );
+    }
     if let Some(alias) = request.alias.as_deref() {
         validate_path_segment(alias, "run alias")?;
     }
 
+    let requested_version = request
+        .requested_version
+        .as_deref()
+        .context("missing version for local run")?;
     let manifest = downloader.download_string(MINECRAFT_VERSION_MANIFEST_URL)?;
     let manifest = parse_minecraft_version_manifest(&manifest)?;
-    let selected = resolve_minecraft_version(&manifest, &request.requested_version)?;
+    let selected = resolve_minecraft_version(&manifest, requested_version)?;
     let version_id = selected.id.clone();
     validate_path_segment(&version_id, "resolved version id")?;
     let install_name = request.alias.as_deref().unwrap_or(DEFAULT_INSTALL_ALIAS);
@@ -2802,6 +2916,16 @@ fn run_minecraft_version_offline_with_services(
         &mods_dir,
         downloader,
     )?;
+    write_remote_version_manifest(
+        &version_dir,
+        install_name,
+        &version_id,
+        install_name,
+        &mods_dir,
+    )?;
+    if let Some(open) = request.open.as_deref() {
+        spawn_remote_version_server(open, &version_dir, install_name)?;
+    }
 
     let command = build_launch_command(
         launcher_root,
@@ -2817,6 +2941,355 @@ fn run_minecraft_version_offline_with_services(
         alias: request.alias.clone(),
         username: request.username.clone(),
     })
+}
+
+fn run_minecraft_version_remote_with_services(
+    launcher_root: &Path,
+    versions_folder: &Path,
+    request: &RunRequest,
+    downloader: &mut impl Downloader,
+    launcher: &mut impl JavaLauncher,
+) -> Result<LaunchedVersion> {
+    let host = request
+        .connect
+        .as_deref()
+        .context("missing required `--connect` for remote run")?;
+    let name = request
+        .name
+        .as_deref()
+        .context("missing required `--name` for remote run")?;
+    validate_host_value(host, "--connect")?;
+    validate_path_segment(name, "remote run name")?;
+    if request.open.is_some() {
+        bail!("remote mode is incompatible with `--open`");
+    }
+
+    let base_url = remote_base_url(host);
+    let manifest_url = format!("{base_url}/{REMOTE_MANIFEST_FILE_NAME}");
+    let manifest: RemoteVersionManifest = serde_yaml::from_str(
+        &downloader
+            .download_string(&manifest_url)
+            .with_context(|| format!("failed to download remote manifest `{manifest_url}`"))?,
+    )
+    .context("failed to parse remote version manifest")?;
+    validate_remote_manifest(&manifest)?;
+    if manifest.name != name {
+        bail!(
+            "remote manifest name `{}` does not match requested name `{name}`",
+            manifest.name
+        );
+    }
+
+    let version_dir = versions_folder.join(&manifest.version).join(name);
+    fs::create_dir_all(&version_dir)
+        .with_context(|| format!("failed to create `{}`", version_dir.display()))?;
+    download_remote_file(
+        downloader,
+        &format!("{base_url}/version.json"),
+        &version_dir.join(format!("{name}.json")),
+    )?;
+    download_remote_file(
+        downloader,
+        &format!("{base_url}/client.jar"),
+        &version_dir.join(format!("{name}.jar")),
+    )?;
+
+    let version_json_path = version_dir.join(format!("{name}.json"));
+    let version_json = fs::read_to_string(&version_json_path)
+        .with_context(|| format!("failed to read `{}`", version_json_path.display()))?;
+    let version_data = parse_minecraft_version_data(&version_json)?;
+    if let Some(asset_index) = version_data.asset_index.as_ref() {
+        install_assets(launcher_root, asset_index, downloader)?;
+    }
+    install_libraries(
+        launcher_root,
+        &version_dir,
+        version_data.libraries,
+        downloader,
+    )?;
+
+    let mods_dir = sync_remote_mods(downloader, &base_url, &version_dir, &manifest)?;
+    let synced =
+        write_remote_version_manifest(&version_dir, name, &manifest.version, name, &mods_dir)?;
+    if synced != manifest {
+        bail!("remote version sync did not converge for `{name}`");
+    }
+
+    let command = build_launch_command(
+        launcher_root,
+        &version_dir,
+        &manifest.version,
+        name,
+        request,
+    )?;
+    launcher.launch(&command)?;
+
+    Ok(LaunchedVersion {
+        id: manifest.version,
+        alias: Some(name.to_owned()),
+        username: request.username.clone(),
+    })
+}
+
+fn validate_remote_manifest(manifest: &RemoteVersionManifest) -> Result<()> {
+    validate_path_segment(&manifest.name, "remote manifest name")?;
+    validate_version_token(&manifest.version, "remote manifest version")?;
+    validate_version_token(&manifest.fabric, "remote manifest Fabric version")?;
+    for mod_name in manifest.mods.keys() {
+        validate_path_segment(mod_name, "remote manifest mod name")?;
+        if !path_has_extension(Path::new(mod_name), "jar") {
+            bail!("remote manifest mod `{mod_name}` is not a jar");
+        }
+    }
+    Ok(())
+}
+
+fn write_remote_version_manifest(
+    version_dir: &Path,
+    name: &str,
+    version_id: &str,
+    install_name: &str,
+    mods_dir: &Path,
+) -> Result<RemoteVersionManifest> {
+    let manifest = RemoteVersionManifest {
+        name: name.to_owned(),
+        version: version_id.to_owned(),
+        fabric: installed_fabric_loader_version(version_dir, install_name)?,
+        mods: installed_mod_hashes(mods_dir)?,
+    };
+    let contents =
+        serde_yaml::to_string(&manifest).context("failed to serialize remote manifest")?;
+    fs::write(version_dir.join(REMOTE_MANIFEST_FILE_NAME), contents).with_context(|| {
+        format!(
+            "failed to write `{}`",
+            version_dir.join(REMOTE_MANIFEST_FILE_NAME).display()
+        )
+    })?;
+    Ok(manifest)
+}
+
+fn installed_fabric_loader_version(version_dir: &Path, install_name: &str) -> Result<String> {
+    let version_json_path = version_dir.join(format!("{install_name}.json"));
+    let version_json = fs::read_to_string(&version_json_path)
+        .with_context(|| format!("failed to read `{}`", version_json_path.display()))?;
+    let version_data = parse_minecraft_version_data(&version_json)?;
+    version_data
+        .libraries
+        .iter()
+        .filter_map(|library| library.name.as_deref())
+        .find_map(|name| name.strip_prefix("net.fabricmc:fabric-loader:"))
+        .map(str::to_owned)
+        .with_context(|| {
+            format!(
+                "installed Minecraft profile `{}` does not include Fabric loader",
+                version_json_path.display()
+            )
+        })
+}
+
+fn installed_mod_hashes(mods_dir: &Path) -> Result<BTreeMap<String, String>> {
+    let mut mods = BTreeMap::new();
+    for entry in fs::read_dir(mods_dir)
+        .with_context(|| format!("failed to read `{}`", mods_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", mods_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || !path_has_extension(&path, "jar") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("installed mod jar name is not valid UTF-8")?
+            .to_owned();
+        mods.insert(file_name, file_md5_hex(&path)?);
+    }
+    Ok(mods)
+}
+
+// ponytail: MD5 is only a local change detector; use SHA-256 if this becomes a trust boundary.
+fn file_md5_hex(path: &Path) -> Result<String> {
+    let contents =
+        fs::read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+    let digest = Md5::digest(&contents);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sync_remote_mods(
+    downloader: &mut impl Downloader,
+    base_url: &str,
+    version_dir: &Path,
+    manifest: &RemoteVersionManifest,
+) -> Result<PathBuf> {
+    let mods_dir = ensure_version_mods_dir(version_dir)?;
+    for entry in fs::read_dir(&mods_dir)
+        .with_context(|| format!("failed to read `{}`", mods_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", mods_dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && path_has_extension(&path, "jar") {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("installed mod jar name is not valid UTF-8")?;
+            if !manifest.mods.contains_key(file_name) {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove `{}`", path.display()))?;
+            }
+        }
+    }
+
+    for (file_name, expected_hash) in &manifest.mods {
+        let destination = mods_dir.join(file_name);
+        let current_hash = if destination.is_file() {
+            Some(file_md5_hex(&destination)?)
+        } else {
+            None
+        };
+        if current_hash.as_deref() != Some(expected_hash.as_str()) {
+            let _ = fs::remove_file(&destination);
+            downloader.download_to_path(&format!("{base_url}/mods/{file_name}"), &destination)?;
+        }
+        let actual_hash = file_md5_hex(&destination)?;
+        if actual_hash != *expected_hash {
+            bail!("downloaded remote mod `{file_name}` did not match manifest hash");
+        }
+    }
+
+    Ok(mods_dir)
+}
+
+fn download_remote_file(downloader: &mut impl Downloader, url: &str, path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to remove `{}`", path.display()));
+        }
+    }
+    downloader.download_to_path(url, path)
+}
+
+fn remote_base_url(host: &str) -> String {
+    let host = host.trim_end_matches('/');
+    if host.starts_with("http://") || host.starts_with("https://") {
+        host.to_owned()
+    } else {
+        format!("http://{}", normalize_socket_address(host))
+    }
+}
+
+fn normalize_socket_address(value: &str) -> String {
+    if value.contains(':') {
+        value.to_owned()
+    } else {
+        format!("{value}:7878")
+    }
+}
+
+fn spawn_remote_version_server(
+    address: &str,
+    version_dir: &Path,
+    install_name: &str,
+) -> Result<()> {
+    let listener = TcpListener::bind(normalize_socket_address(address))
+        .with_context(|| format!("failed to bind remote server at `{address}`"))?;
+    let version_dir = version_dir.to_path_buf();
+    let install_name = install_name.to_owned();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = handle_remote_version_request(stream, &version_dir, &install_name);
+        }
+    });
+    Ok(())
+}
+
+// ponytail: tiny stdlib HTTP server; add routing/auth only if remote sharing grows.
+fn handle_remote_version_request(
+    mut stream: TcpStream,
+    version_dir: &Path,
+    install_name: &str,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    let size = stream.read(&mut buffer).context("failed to read request")?;
+    let request = String::from_utf8_lossy(&buffer[..size]);
+    let Some(line) = request.lines().next() else {
+        return write_http_response(&mut stream, "400 Bad Request", "text/plain", b"bad request");
+    };
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let raw_path = parts.next().unwrap_or_default();
+    if method != "GET" {
+        return write_http_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain",
+            b"method not allowed",
+        );
+    }
+
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let resource = match remote_resource_path(version_dir, install_name, path)? {
+        Some(resource) => resource,
+        None => {
+            return write_http_response(&mut stream, "404 Not Found", "text/plain", b"not found");
+        }
+    };
+    let body = fs::read(&resource.0)
+        .with_context(|| format!("failed to read `{}`", resource.0.display()))?;
+    write_http_response(&mut stream, "200 OK", resource.1, &body)
+}
+
+fn remote_resource_path(
+    version_dir: &Path,
+    install_name: &str,
+    path: &str,
+) -> Result<Option<(PathBuf, &'static str)>> {
+    if path == "/" || path == format!("/{REMOTE_MANIFEST_FILE_NAME}") {
+        return Ok(Some((
+            version_dir.join(REMOTE_MANIFEST_FILE_NAME),
+            "application/x-yaml",
+        )));
+    }
+    if path == "/version.json" {
+        return Ok(Some((
+            version_dir.join(format!("{install_name}.json")),
+            "application/json",
+        )));
+    }
+    if path == "/client.jar" {
+        return Ok(Some((
+            version_dir.join(format!("{install_name}.jar")),
+            "application/java-archive",
+        )));
+    }
+    if let Some(file_name) = path.strip_prefix("/mods/") {
+        validate_path_segment(file_name, "remote mod request")?;
+        return Ok(Some((
+            version_dir.join(MODS_FOLDER_NAME).join(file_name),
+            "application/java-archive",
+        )));
+    }
+    Ok(None)
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .context("failed to write response headers")?;
+    stream
+        .write_all(body)
+        .context("failed to write response body")
 }
 
 fn ensure_installed_profile_loads_fabric_if_needed(
@@ -4043,6 +4516,19 @@ fn validate_username(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_host_value(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    if value.trim() != value {
+        bail!("{label} cannot contain leading or trailing whitespace");
+    }
+    if value.chars().any(char::is_whitespace) {
+        bail!("{label} cannot contain whitespace");
+    }
+    Ok(())
+}
+
 fn validate_version_token(value: &str, label: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{label} cannot be empty");
@@ -4151,7 +4637,7 @@ fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -5182,6 +5668,9 @@ mod tests {
           "url": "https://example.test/lib-1.0.jar"
         }
       }
+    },
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3"
     }
   ]
 }
@@ -5567,8 +6056,11 @@ mod tests {
                 assert_eq!(
                     requested,
                     &RunRequest {
-                        requested_version: "1.18".to_owned(),
+                        requested_version: Some("1.18".to_owned()),
+                        connect: None,
+                        name: None,
                         alias: Some("survival".to_owned()),
+                        open: None,
                         username: "Player_1".to_owned(),
                     }
                 );
@@ -5670,6 +6162,9 @@ mod tests {
           "url": "https://example.test/lib-1.0.jar"
         }
       }
+    },
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3"
     }
   ]
 }
@@ -5697,8 +6192,11 @@ mod tests {
         )]);
         let mut launcher = FakeJavaLauncher::default();
         let request = RunRequest {
-            requested_version: "latest".to_owned(),
+            requested_version: Some("latest".to_owned()),
+            connect: None,
+            name: None,
             alias: None,
+            open: None,
             username: "Player_1".to_owned(),
         };
 
@@ -5860,8 +6358,11 @@ mod tests {
         ]);
         let mut launcher = FakeJavaLauncher::default();
         let request = RunRequest {
-            requested_version: "latest".to_owned(),
+            requested_version: Some("latest".to_owned()),
+            connect: None,
+            name: None,
             alias: None,
+            open: None,
             username: "Player_1".to_owned(),
         };
 
@@ -5911,6 +6412,101 @@ mod tests {
             .unwrap()
             + 1;
         assert!(command.args[classpath_index].contains("fabric-loader-0.19.3.jar"));
+    }
+
+    #[test]
+    fn run_remote_syncs_manifest_and_mods_before_launch() {
+        let repo = tempfile::tempdir().unwrap();
+        let launcher_root = repo.path().join("launcher");
+        let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+        let base_url = "http://server.test:7878";
+        let remote_mod = "remote mod";
+        let remote_mod_hash = Md5::digest(remote_mod.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let remote_manifest = format!(
+            "name: coop\nversion: 1.20.4\nfabric: 0.19.3\nmods:\n  cool.jar: {remote_mod_hash}\n"
+        );
+        let version_json = r#"
+{
+  "type": "release",
+  "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+  "arguments": {
+    "jvm": [
+      "-cp",
+      "${classpath}"
+    ],
+    "game": [
+      "--username",
+      "${auth_player_name}"
+    ]
+  },
+  "downloads": {},
+  "libraries": [
+    {
+      "name": "net.fabricmc:fabric-loader:0.19.3"
+    }
+  ]
+}
+"#;
+        let manifest_url = format!("{base_url}/{REMOTE_MANIFEST_FILE_NAME}");
+        let version_url = format!("{base_url}/version.json");
+        let client_url = format!("{base_url}/client.jar");
+        let mod_url = format!("{base_url}/mods/cool.jar");
+        let mut downloader = FakeDownloader::new([
+            (manifest_url.as_str(), remote_manifest.as_str()),
+            (version_url.as_str(), version_json),
+            (client_url.as_str(), "client"),
+            (mod_url.as_str(), remote_mod),
+        ]);
+        let mut launcher = FakeJavaLauncher::default();
+        let request = RunRequest {
+            requested_version: None,
+            connect: Some("server.test:7878".to_owned()),
+            name: Some("coop".to_owned()),
+            alias: None,
+            open: None,
+            username: "Player_1".to_owned(),
+        };
+
+        let launched = run_minecraft_version_offline_with_services(
+            &launcher_root,
+            &versions_folder,
+            &request,
+            &mut downloader,
+            &mut launcher,
+        )
+        .unwrap();
+
+        assert_eq!(
+            launched,
+            LaunchedVersion {
+                id: "1.20.4".to_owned(),
+                alias: Some("coop".to_owned()),
+                username: "Player_1".to_owned(),
+            }
+        );
+        let version_dir = versions_folder.join("1.20.4/coop");
+        assert_eq!(
+            fs::read(version_dir.join("mods/cool.jar")).unwrap(),
+            b"remote mod"
+        );
+        let synced_manifest: RemoteVersionManifest =
+            serde_yaml::from_str(&fs::read_to_string(version_dir.join("remote.yml")).unwrap())
+                .unwrap();
+        assert_eq!(synced_manifest.name, "coop");
+        assert_eq!(synced_manifest.version, "1.20.4");
+        assert_eq!(synced_manifest.fabric, "0.19.3");
+        assert_eq!(synced_manifest.mods.get("cool.jar"), Some(&remote_mod_hash));
+        let command = launcher.command.unwrap();
+        assert_eq!(command.current_dir, version_dir);
+        assert!(
+            command
+                .args
+                .contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_owned())
+        );
+        assert!(command.args.contains(&"Player_1".to_owned()));
     }
 
     #[cfg(unix)]
@@ -6501,7 +7097,13 @@ mod tests {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create `{}`", parent.display()))?;
             }
-            fs::write(path, url).with_context(|| format!("failed to write `{}`", path.display()))
+            let contents = self
+                .strings
+                .get(url)
+                .map(String::as_bytes)
+                .unwrap_or_else(|| url.as_bytes());
+            fs::write(path, contents)
+                .with_context(|| format!("failed to write `{}`", path.display()))
         }
     }
 }

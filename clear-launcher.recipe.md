@@ -13,6 +13,7 @@ Clear code minecraft launcher
 **My Mods Folder:** Folder where downloaded and created mods lives, this is located on the **Config File**'s mods_folder property and defaults to `{Launcher Path}/mods`
 **Version Mod Folder:** Folder located at `{Version Folder}/mods`, it stored installed mod for an specific version alias
 **Source Folder:** Current folder where this file is located, it is the actual location of the source code, non dependent on pwd
+**Version Manifest File:** File located at `{Version Folder}/remote.yml `containing the information about the mods, minecraft version, etc...
 
 ## 1. Compilation Settings & Configuration File
 
@@ -93,9 +94,53 @@ Alias provide ways to have different setups for the same version
 
 ### 4. [Command] Running minecraft
 
-**Usage:** `{CLI Name} run {version} [--alias {alias}] --username {username}`
+**Usage:** `{CLI Name} run {version | --connect {host} --name {name}} [--alias {alias}] [--open [host = 0.0.0.0]] --username {username}`
 
-Runs the minecraft game in **offline** mode with the specified username, the version is resolved in the similar way of **install**
+Runs the minecraft game in **offline** mode with the specified username, the version is resolved in the similar way of **install**.
+
+There are two ways to run the game, in local mode with **version** or remote mode with the `--connect` flag.
+
+
+
+#### 4.1 - Manifest File
+
+Before running a game, the system **must** automatically create (or update) a the **Remote Version Manifest File** with the following fields:
+
+```yaml
+name: {name}
+version: {minecraft-version}
+fabric: {fabric-version}
+mods:
+	{mod-name}: {hash}
+```
+
+This must include every single installed mod jar file for the specified version
+
+
+
+
+
+#### 4.2 - Remote mode
+
+
+
+**Note:** Remote mode is incompatible with open mode.
+
+Running the app in remote mode implies downloading the remote minecraft version and its mod into a folder named after the argument at `--name` that is required.  It must download all the metadata and mod jars, not the mod source data.
+
+It must also keep on sync the **Remote Version Manifest File **, so if any change or discrepancy is detected between the local and remote version, it must resolve it until it stays the same
+
+
+
+
+
+#### 4.3 - Open Mode
+
+####
+
+**Note:** Open mode is incompatible with remote mode.
+
+When running with the  `--open [host]` flag, the system exposes an http server listening to that specific port, providing all necessary functionalities for other clients to use it with the  `--remote` flag.
 
 
 
@@ -184,4 +229,3 @@ The mod config file is a file located at a **Mod Folder**'s mod.yml and it conta
 | **name**     | ID / Name of the mod                        | yes          |             |
 | **build**    | Path of the jarfile generated after build   | no           |             |
 | **version**  | Current version of the mod, auto increments | no           |             |
-
