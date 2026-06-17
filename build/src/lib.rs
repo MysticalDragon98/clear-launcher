@@ -4119,6 +4119,9 @@ fn ensure_offline_lan_client_jar(version_dir: &Path, client_jar: &Path) -> Resul
                 client_jar.display()
             )
         })?;
+        if is_jar_signature_file(entry.name()) {
+            continue;
+        }
         let options = zip::write::FileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .last_modified_time(entry.last_modified());
@@ -4153,6 +4156,15 @@ fn ensure_offline_lan_client_jar(version_dir: &Path, client_jar: &Path) -> Resul
         .finish()
         .with_context(|| format!("failed to finish `{}`", patched_jar.display()))?;
     Ok(patched_jar)
+}
+
+fn is_jar_signature_file(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "META-INF/MANIFEST.MF"
+        || upper.ends_with(".SF")
+        || upper.ends_with(".RSA")
+        || upper.ends_with(".DSA")
+        || upper.ends_with(".EC")
 }
 
 fn patch_integrated_server_lan_auth(class: &[u8]) -> Result<Option<Vec<u8>>> {
