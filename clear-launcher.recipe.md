@@ -15,6 +15,8 @@ Clear code minecraft launcher
 **Source Folder:** Current folder where this file is located, it is the actual location of the source code, non dependent on pwd
 **Version Manifest File:** File located at `{Version Folder}/remote.yml `containing the information about the mods, minecraft version, etc...
 
+
+
 ## 1. Compilation Settings & Configuration File
 
 Compilation settings are BUILD ONLY settings defined in the `settings.yml` file, that must follow the following properties:
@@ -40,10 +42,22 @@ Configuration file is defined at `{Launcher Path}/config.yml` and it is the runt
 
 
 
-## no3. Sources
+## 3. Sources
 
 **Inside a Minecraft Launcher:** ./sources/inside-a-minecraft-launcher.md
 **Fabric Documentation:** Read the context from https://docs.fabricmc.net
+**Modrinth API Docs:** https://docs.modrinth.com/api/
+
+### Source Caching
+
+In order to optimize the building process, do not read directly the **Modrinth API Docs**, instead:
+
+1. Verify if there is a `.cache/modrinth-openapi.json`  file, if it exists read it directly
+2. If the file does not exists, generate it from the documentation
+
+The `modrinth-openapi.json` is the file you will take as source of truth for api documentation
+
+
 
 ## 4. Building
 
@@ -118,8 +132,6 @@ This must include every single installed mod jar file for the specified version
 
 
 
-
-
 #### 4.2 - Remote mode
 
 
@@ -128,9 +140,9 @@ This must include every single installed mod jar file for the specified version
 
 Running the app in remote mode implies downloading the remote minecraft version and its mod into a folder named after the argument at `--name` that is required.  It must download all the metadata and mod jars, not the mod source data.
 
-It must also keep on sync the **Remote Version Manifest File **, so if any change or discrepancy is detected between the local and remote version, it must resolve it until it stays the same
+It must also keep on sync the **Version Manifest File **, so if any change or discrepancy is detected between the local and remote version, it must resolve it until it stays the same.
 
-
+The name of the manifest file normally dont match the --name arg, and that's ok, this is because the --name is used to name the local version while the remote version can have different name
 
 
 
@@ -159,6 +171,8 @@ The mod **must** follow this default configuration
 
 After creating the mod, copy the  `{Source Folder}/scaffolding/mods` into the newly created folder
 
+
+
 ### 6. [Command] Building Mods
 
 **Usage:** `{CLI Name} build mod [name] [--minor] [--major]`
@@ -183,6 +197,8 @@ The process of installing a mod requires building the mod, so if no jar is built
 
 Installing a mod that is already installed on that **Version Folder** automatically replaces any old version of the mod, so it's effectively an update
 
+It must always update the version on the **Version Manifest File**
+
 
 
 ### 8. [Command] Downloading Mods from Git URL
@@ -198,6 +214,24 @@ Installing a mod that is already installed on that **Version Folder** automatica
 **Usage:** `{CLI Name} test mod [name]`
 
 Initializes a full local minecraft copy on the ./.minecraft relative to the mod folder (.gitignored), and run the minecraft game with only this specific mod attached, if name is not provided, use the cwd
+
+### 10. [Command] Searching Mods
+
+**Usage:** {CLI Name} search mod {term} [--version {version-name}]
+
+Searches mod via a term via **Modrinth API** related to a version, if no version is provided, use the `default` one.  Returns a list of mods.
+
+
+
+### 10. [Command] Searching Mods
+
+**Usage:** {CLI Name} search mod {mod-name} [--version {version-name}]
+
+Installs a mod via a term via **Modrinth API** related to a version, if no version is provided, use the `default` one.
+
+It must download the .jar and update the **Version Manifest File**
+
+
 
 ## 6. CLI Style
 

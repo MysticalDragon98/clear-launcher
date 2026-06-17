@@ -41,6 +41,7 @@ pub const FABRIC_MAVEN_URL: &str = "https://maven.fabricmc.net";
 pub const GRADLE_CURRENT_VERSION_URL: &str = "https://services.gradle.org/versions/current";
 pub const MINECRAFT_VERSION_MANIFEST_URL: &str =
     "https://launchermeta.mojang.com/mc/game/version_manifest.json";
+pub const MODRINTH_SEARCH_URL: &str = "https://api.modrinth.com/v2/search";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledSettings {
@@ -632,6 +633,41 @@ fn execute_with_services(
                 ),
             )
         }
+        Some("search") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `search`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown search target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let term = args.next().with_context(|| {
+                format!(
+                    "missing term for `search mod`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            let search_request = parse_search_mod_request(term, args)?;
+
+            write_log(
+                stderr,
+                format_args!("Searching Modrinth for `{}`", search_request.term),
+            )?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            ensure_launcher_root(&launcher_root)?;
+            let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            let mut downloader = HttpDownloader::new();
+            let mods = search_modrinth_mods(&versions_folder, &search_request, &mut downloader)?;
+            write_searched_mods_output(&mods, stdout)?;
+            write_log(stderr, format_args!("Finished searching Modrinth"))
+        }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
                 bail!("unexpected argument for `configure-path`: `{extra}`");
@@ -745,6 +781,12 @@ pub struct TestModRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchModRequest {
+    pub term: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedMod {
     pub name: String,
     pub path: PathBuf,
@@ -783,6 +825,13 @@ pub struct TestedMod {
     pub launcher_root: PathBuf,
     pub jar: PathBuf,
     pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchedMod {
+    pub title: String,
+    pub slug: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1020,6 +1069,31 @@ fn parse_test_mod_request(mut args: impl Iterator<Item = String>) -> Result<Test
     }
 
     Ok(TestModRequest { name })
+}
+
+fn parse_search_mod_request(
+    term: String,
+    mut args: impl Iterator<Item = String>,
+) -> Result<SearchModRequest> {
+    if term.trim().is_empty() {
+        bail!("search term cannot be empty");
+    }
+    let mut version = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--version" {
+            let value = args
+                .next()
+                .context("missing value for `--version` in `search mod`")?;
+            set_optional_version(&mut version, value, "--version")?;
+        } else if let Some(value) = arg.strip_prefix("--version=") {
+            set_optional_version(&mut version, value.to_owned(), "--version")?;
+        } else {
+            bail!("unexpected argument for `search mod`: `{arg}`");
+        }
+    }
+
+    Ok(SearchModRequest { term, version })
 }
 
 fn set_version_bump(
@@ -2211,6 +2285,7 @@ fn install_mod_project_with_services(
             destination.display()
         )
     })?;
+    write_remote_version_manifest(&version_dir, alias, minecraft_version, alias, &mods_dir)?;
 
     Ok(InstalledMod {
         name: mod_config.name,
@@ -2973,12 +3048,6 @@ fn run_minecraft_version_remote_with_services(
     )
     .context("failed to parse remote version manifest")?;
     validate_remote_manifest(&manifest)?;
-    if manifest.name != name {
-        bail!(
-            "remote manifest name `{}` does not match requested name `{name}`",
-            manifest.name
-        );
-    }
 
     let version_dir = versions_folder.join(&manifest.version).join(name);
     fs::create_dir_all(&version_dir)
@@ -3009,8 +3078,13 @@ fn run_minecraft_version_remote_with_services(
     )?;
 
     let mods_dir = sync_remote_mods(downloader, &base_url, &version_dir, &manifest)?;
-    let synced =
-        write_remote_version_manifest(&version_dir, name, &manifest.version, name, &mods_dir)?;
+    let synced = write_remote_version_manifest(
+        &version_dir,
+        &manifest.name,
+        &manifest.version,
+        name,
+        &mods_dir,
+    )?;
     if synced != manifest {
         bail!("remote version sync did not converge for `{name}`");
     }
@@ -3106,6 +3180,87 @@ fn installed_mod_hashes(mods_dir: &Path) -> Result<BTreeMap<String, String>> {
         mods.insert(file_name, file_md5_hex(&path)?);
     }
     Ok(mods)
+}
+
+fn search_modrinth_mods(
+    versions_folder: &Path,
+    request: &SearchModRequest,
+    downloader: &mut impl Downloader,
+) -> Result<Vec<SearchedMod>> {
+    let minecraft_version =
+        resolve_installed_minecraft_version(versions_folder, request.version.as_deref())?;
+    let facets = format!(r#"[["project_type:mod"],["versions:{minecraft_version}"]]"#);
+    let url = format!(
+        "{MODRINTH_SEARCH_URL}?query={}&limit=10&facets={}",
+        percent_encode_query(&request.term),
+        percent_encode_query(&facets)
+    );
+    let response: ModrinthSearchResponse = serde_json::from_str(
+        &downloader
+            .download_string(&url)
+            .with_context(|| format!("failed to search Modrinth for `{}`", request.term))?,
+    )
+    .context("failed to parse Modrinth search response")?;
+
+    Ok(response
+        .hits
+        .into_iter()
+        .map(|hit| SearchedMod {
+            title: hit.title,
+            slug: hit.slug,
+            description: hit.description,
+        })
+        .collect())
+}
+
+fn resolve_installed_minecraft_version(
+    versions_folder: &Path,
+    alias: Option<&str>,
+) -> Result<String> {
+    let alias = alias.unwrap_or(DEFAULT_INSTALL_ALIAS);
+    validate_path_segment(alias, "search version")?;
+
+    for entry in fs::read_dir(versions_folder)
+        .with_context(|| format!("failed to read `{}`", versions_folder.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("failed to read entry in `{}`", versions_folder.display()))?;
+        if entry.path().join(alias).is_dir() {
+            let version = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("installed Minecraft version is not UTF-8"))?;
+            validate_version_token(&version, "installed Minecraft version")?;
+            return Ok(version);
+        }
+    }
+
+    bail!("installed version alias `{alias}` was not found")
+}
+
+fn percent_encode_query(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthSearchResponse {
+    hits: Vec<ModrinthSearchHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthSearchHit {
+    title: String,
+    slug: String,
+    description: String,
 }
 
 // ponytail: MD5 is only a local change detector; use SHA-256 if this becomes a trust boundary.
@@ -4631,13 +4786,25 @@ fn write_tested_mod_output(tested: &TestedMod, stdout: &mut impl Write) -> Resul
     .context("failed to write test mod output")
 }
 
+fn write_searched_mods_output(mods: &[SearchedMod], stdout: &mut impl Write) -> Result<()> {
+    for found in mods {
+        writeln!(
+            stdout,
+            "{} ({}) - {}",
+            found.title, found.slug, found.description
+        )
+        .context("failed to write searched mod output")?;
+    }
+    Ok(())
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} search mod {{term}} [--version {{version-name}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -5548,6 +5715,11 @@ mod tests {
         let mod_dir = launcher_root.join(MODS_FOLDER_NAME).join("cool-blocks");
         fs::create_dir_all(&installed_mods_dir).unwrap();
         fs::create_dir_all(&mod_dir).unwrap();
+        fs::write(
+            version_dir.join("survival.json"),
+            r#"{"downloads":{},"libraries":[{"name":"net.fabricmc:fabric-loader:0.19.3"}]}"#,
+        )
+        .unwrap();
         fs::write(installed_mods_dir.join("cool-blocks-1.1.0.jar"), "old").unwrap();
         fs::write(installed_mods_dir.join("other-mod-1.0.0.jar"), "other").unwrap();
         fs::write(
@@ -5585,7 +5757,46 @@ mod tests {
         assert_eq!(fs::read(&installed.destination).unwrap(), b"fake jar");
         assert!(!installed_mods_dir.join("cool-blocks-1.1.0.jar").exists());
         assert!(installed_mods_dir.join("other-mod-1.0.0.jar").exists());
+        let manifest: RemoteVersionManifest =
+            serde_yaml::from_str(&fs::read_to_string(version_dir.join("remote.yml")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.name, "survival");
+        assert_eq!(manifest.version, "1.20.4");
+        assert_eq!(manifest.fabric, "0.19.3");
+        assert!(manifest.mods.contains_key("cool-blocks-1.2.0.jar"));
         assert_eq!(builder.build_dirs, vec![mod_dir]);
+    }
+
+    #[test]
+    fn searches_modrinth_for_installed_version_alias() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        fs::create_dir_all(versions_folder.join("1.20.4/default")).unwrap();
+        let facets = percent_encode_query(r#"[["project_type:mod"],["versions:1.20.4"]]"#);
+        let url = format!("{MODRINTH_SEARCH_URL}?query=sodium&limit=10&facets={facets}");
+        let mut downloader = FakeDownloader::new([(
+            url.as_str(),
+            r#"{"hits":[{"title":"Sodium","slug":"sodium","description":"Fast renderer"}]}"#,
+        )]);
+
+        let mods = search_modrinth_mods(
+            &versions_folder,
+            &SearchModRequest {
+                term: "sodium".to_owned(),
+                version: None,
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(
+            mods,
+            vec![SearchedMod {
+                title: "Sodium".to_owned(),
+                slug: "sodium".to_owned(),
+                description: "Fast renderer".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -6464,7 +6675,7 @@ mod tests {
         let request = RunRequest {
             requested_version: None,
             connect: Some("server.test:7878".to_owned()),
-            name: Some("coop".to_owned()),
+            name: Some("local-coop".to_owned()),
             alias: None,
             open: None,
             username: "Player_1".to_owned(),
@@ -6483,11 +6694,11 @@ mod tests {
             launched,
             LaunchedVersion {
                 id: "1.20.4".to_owned(),
-                alias: Some("coop".to_owned()),
+                alias: Some("local-coop".to_owned()),
                 username: "Player_1".to_owned(),
             }
         );
-        let version_dir = versions_folder.join("1.20.4/coop");
+        let version_dir = versions_folder.join("1.20.4/local-coop");
         assert_eq!(
             fs::read(version_dir.join("mods/cool.jar")).unwrap(),
             b"remote mod"
