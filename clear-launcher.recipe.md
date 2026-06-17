@@ -207,6 +207,8 @@ It must always update the version on the **Version Manifest File**
 
  Clones via git url a repository into `{My Mods Folder}/{name}`, if the folder already exists, abort. The name must be resolved from the mod.yml file and not from the repository name.  If the repository does not contains a valid mod.yml, abort.
 
+It must always update the version on the **Version Manifest File**
+
 
 
 ### 9. [Command] Testing Mods
@@ -215,21 +217,45 @@ It must always update the version on the **Version Manifest File**
 
 Initializes a full local minecraft copy on the ./.minecraft relative to the mod folder (.gitignored), and run the minecraft game with only this specific mod attached, if name is not provided, use the cwd
 
+
+
 ### 10. [Command] Searching Modrinth Mods
 
-**Usage:** {CLI Name} search mod {term} [--version {version-name}]
+**Usage:** {CLI Name} search mod {term} [--version {version-name}] [--mod-versions]
 
 Searches mod via a term via **Modrinth API** related to a version, if no version is provided, use the `default` one.  Returns a list of mods.
 
+If the --mod-versions flag is provided, it will list all available versions of the mod separated by comma
 
 
-### 10. [Command] Downloading Modrinth Mods
 
-**Usage:** {CLI Name} download mod {mod-name} [--version {version-name}]
+### 11. [Command] Downloading Modrinth Mods
+
+**Usage:** {CLI Name} download mod {mod-name} [--version {version-name}] [--mod-version {version-name}]
 
 Installs a mod via a term via **Modrinth API** related to a version, if no version is provided, use the `default` one.
 
+If an specific version is provided via `--mod-version` then download that specific version
+
 It must download the .jar and update the **Version Manifest File**
+
+
+
+### 12. [Command] Listing Mods
+
+**Usage:** {CLI Name} list mods [--version {version-name}]
+
+List installed mods, if no version is provided, use the `default` one
+
+
+
+### 13. [Command] Uninstalling Mods
+
+**Usage:** {CLI Name} uninstall mod {mod-name} [--version {version-name}]
+
+Removes `mod-name` jar from the mods folder, if no version is provided, use the `default` one
+
+It must always update the version on the **Version Manifest File**
 
 
 

@@ -669,6 +669,31 @@ fn execute_with_services(
             write_searched_mods_output(&mods, stdout)?;
             write_log(stderr, format_args!("Finished searching Modrinth"))
         }
+        Some("list") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `list`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mods" {
+                bail!(
+                    "unknown list target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let request = parse_list_mods_request(args)?;
+            write_log(stderr, format_args!("Listing installed mods"))?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            ensure_launcher_root(&launcher_root)?;
+            let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            let mut downloader = HttpDownloader::new();
+            let mods = list_installed_mods(&versions_folder, &request, &mut downloader)?;
+            write_listed_mods_output(&mods, stdout)?;
+            write_log(stderr, format_args!("Finished listing installed mods"))
+        }
         Some("download") => {
             let target = args.next().with_context(|| {
                 format!(
@@ -704,6 +729,37 @@ fn execute_with_services(
                 download_modrinth_mod(&versions_folder, &download_request, &mut downloader)?;
             write_downloaded_mod_output(&downloaded, stdout)?;
             write_log(stderr, format_args!("Finished downloading Modrinth mod"))
+        }
+        Some("uninstall") => {
+            let target = args.next().with_context(|| {
+                format!(
+                    "missing target for `uninstall`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            if target != "mod" {
+                bail!(
+                    "unknown uninstall target `{target}`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                );
+            }
+
+            let mod_name = args.next().with_context(|| {
+                format!(
+                    "missing mod name for `uninstall mod`\n\n{}",
+                    usage_text(DEFAULT_CLI_NAME)
+                )
+            })?;
+            let request = parse_uninstall_mod_request(mod_name, args)?;
+            write_log(stderr, format_args!("Uninstalling mod `{}`", request.name))?;
+            write_log(stderr, format_args!("Using compiled launcher settings"))?;
+            let launcher_root = launcher_root_from_compiled_settings(env_get)?;
+            ensure_launcher_root(&launcher_root)?;
+            let versions_folder = launcher_root.join(VERSIONS_FOLDER_NAME);
+            let mut downloader = HttpDownloader::new();
+            let uninstalled = uninstall_mod(&versions_folder, &request, &mut downloader)?;
+            write_uninstalled_mod_output(&uninstalled, stdout)?;
+            write_log(stderr, format_args!("Finished uninstalling mod"))
         }
         Some("configure-path") => {
             if let Some(extra) = args.next() {
@@ -821,6 +877,25 @@ pub struct TestModRequest {
 pub struct SearchModRequest {
     pub term: String,
     pub version: Option<String>,
+    pub mod_versions: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadModRequest {
+    pub term: String,
+    pub version: Option<String>,
+    pub mod_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListModsRequest {
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallModRequest {
+    pub name: String,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,6 +944,7 @@ pub struct SearchedMod {
     pub title: String,
     pub slug: String,
     pub description: String,
+    pub versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -877,6 +953,14 @@ pub struct DownloadedMod {
     pub minecraft_version: String,
     pub alias: String,
     pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstalledMod {
+    pub name: String,
+    pub minecraft_version: String,
+    pub alias: String,
+    pub removed: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1124,6 +1208,7 @@ fn parse_search_mod_request(
         bail!("search term cannot be empty");
     }
     let mut version = None;
+    let mut mod_versions = false;
 
     while let Some(arg) = args.next() {
         if arg == "--version" {
@@ -1133,22 +1218,96 @@ fn parse_search_mod_request(
             set_optional_version(&mut version, value, "--version")?;
         } else if let Some(value) = arg.strip_prefix("--version=") {
             set_optional_version(&mut version, value.to_owned(), "--version")?;
+        } else if arg == "--mod-versions" {
+            if mod_versions {
+                bail!("`--mod-versions` was provided more than once");
+            }
+            mod_versions = true;
         } else {
             bail!("unexpected argument for `search mod`: `{arg}`");
         }
     }
 
-    Ok(SearchModRequest { term, version })
+    Ok(SearchModRequest {
+        term,
+        version,
+        mod_versions,
+    })
 }
 
 fn parse_download_mod_request(
     term: String,
-    args: impl Iterator<Item = String>,
-) -> Result<SearchModRequest> {
+    mut args: impl Iterator<Item = String>,
+) -> Result<DownloadModRequest> {
     if term.trim().is_empty() {
         bail!("mod name cannot be empty");
     }
-    parse_search_mod_request(term, args)
+    let mut version = None;
+    let mut mod_version = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--version" {
+            let value = args
+                .next()
+                .context("missing value for `--version` in `download mod`")?;
+            set_optional_version(&mut version, value, "--version")?;
+        } else if let Some(value) = arg.strip_prefix("--version=") {
+            set_optional_version(&mut version, value.to_owned(), "--version")?;
+        } else if arg == "--mod-version" {
+            let value = args
+                .next()
+                .context("missing value for `--mod-version` in `download mod`")?;
+            set_optional_version(&mut mod_version, value, "--mod-version")?;
+        } else if let Some(value) = arg.strip_prefix("--mod-version=") {
+            set_optional_version(&mut mod_version, value.to_owned(), "--mod-version")?;
+        } else {
+            bail!("unexpected argument for `download mod`: `{arg}`");
+        }
+    }
+
+    Ok(DownloadModRequest {
+        term,
+        version,
+        mod_version,
+    })
+}
+
+fn parse_list_mods_request(mut args: impl Iterator<Item = String>) -> Result<ListModsRequest> {
+    let mut version = None;
+    while let Some(arg) = args.next() {
+        if arg == "--version" {
+            let value = args
+                .next()
+                .context("missing value for `--version` in `list mods`")?;
+            set_optional_version(&mut version, value, "--version")?;
+        } else if let Some(value) = arg.strip_prefix("--version=") {
+            set_optional_version(&mut version, value.to_owned(), "--version")?;
+        } else {
+            bail!("unexpected argument for `list mods`: `{arg}`");
+        }
+    }
+    Ok(ListModsRequest { version })
+}
+
+fn parse_uninstall_mod_request(
+    name: String,
+    mut args: impl Iterator<Item = String>,
+) -> Result<UninstallModRequest> {
+    validate_path_segment(&name, "mod name")?;
+    let mut version = None;
+    while let Some(arg) = args.next() {
+        if arg == "--version" {
+            let value = args
+                .next()
+                .context("missing value for `--version` in `uninstall mod`")?;
+            set_optional_version(&mut version, value, "--version")?;
+        } else if let Some(value) = arg.strip_prefix("--version=") {
+            set_optional_version(&mut version, value.to_owned(), "--version")?;
+        } else {
+            bail!("unexpected argument for `uninstall mod`: `{arg}`");
+        }
+    }
+    Ok(UninstallModRequest { name, version })
 }
 
 fn set_version_bump(
@@ -3263,17 +3422,25 @@ fn search_modrinth_mods(
     Ok(response
         .hits
         .into_iter()
-        .map(|hit| SearchedMod {
-            title: hit.title,
-            slug: hit.slug,
-            description: hit.description,
+        .map(|hit| {
+            let versions = if request.mod_versions {
+                modrinth_version_numbers(&hit.slug, Some(&minecraft_version), downloader)?
+            } else {
+                Vec::new()
+            };
+            Ok(SearchedMod {
+                title: hit.title,
+                slug: hit.slug,
+                description: hit.description,
+                versions,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()?)
 }
 
 fn download_modrinth_mod(
     versions_folder: &Path,
-    request: &SearchModRequest,
+    request: &DownloadModRequest,
     downloader: &mut impl Downloader,
 ) -> Result<DownloadedMod> {
     let target = resolve_installed_minecraft_target(
@@ -3295,6 +3462,10 @@ fn download_modrinth_mod(
     .context("failed to parse Modrinth version response")?;
     let files: Vec<ModrinthFile> = versions
         .into_iter()
+        .filter(|version| match request.mod_version.as_deref() {
+            Some(wanted) => version.version_number == wanted,
+            None => true,
+        })
         .flat_map(|version| version.files)
         .filter(|file| path_has_extension(Path::new(&file.filename), "jar"))
         .collect();
@@ -3321,6 +3492,108 @@ fn download_modrinth_mod(
         minecraft_version: target.minecraft_version,
         alias: target.alias,
         destination,
+    })
+}
+
+fn modrinth_version_numbers(
+    slug: &str,
+    minecraft_version: Option<&str>,
+    downloader: &mut impl Downloader,
+) -> Result<Vec<String>> {
+    let mut url = format!(
+        "{MODRINTH_PROJECT_URL}/{}/version?loaders={}",
+        percent_encode_query(slug),
+        percent_encode_query(r#"["fabric"]"#)
+    );
+    if let Some(minecraft_version) = minecraft_version {
+        url.push_str("&game_versions=");
+        url.push_str(&percent_encode_query(&format!(
+            r#"["{minecraft_version}"]"#
+        )));
+    }
+    let versions: Vec<ModrinthVersion> = serde_json::from_str(
+        &downloader
+            .download_string(&url)
+            .with_context(|| format!("failed to list Modrinth versions for `{slug}`"))?,
+    )
+    .context("failed to parse Modrinth version response")?;
+    Ok(versions
+        .into_iter()
+        .map(|version| version.version_number)
+        .collect())
+}
+
+fn list_installed_mods(
+    versions_folder: &Path,
+    request: &ListModsRequest,
+    downloader: &mut impl Downloader,
+) -> Result<Vec<String>> {
+    let target = resolve_installed_minecraft_target(
+        versions_folder,
+        request.version.as_deref(),
+        downloader,
+    )?;
+    let mods_dir = target.version_dir.join(MODS_FOLDER_NAME);
+    if !mods_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut mods = installed_mod_hashes(&mods_dir)?
+        .into_keys()
+        .collect::<Vec<_>>();
+    mods.sort();
+    Ok(mods)
+}
+
+fn uninstall_mod(
+    versions_folder: &Path,
+    request: &UninstallModRequest,
+    downloader: &mut impl Downloader,
+) -> Result<UninstalledMod> {
+    let target = resolve_installed_minecraft_target(
+        versions_folder,
+        request.version.as_deref(),
+        downloader,
+    )?;
+    let mods_dir = ensure_version_mods_dir(&target.version_dir)?;
+    let mut removed = Vec::new();
+
+    for entry in fs::read_dir(&mods_dir)
+        .with_context(|| format!("failed to read `{}`", mods_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in `{}`", mods_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || !path_has_extension(&path, "jar") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("installed mod jar name is not valid UTF-8")?;
+        if file_name == request.name || installed_jar_matches_mod_id(&path, &request.name) {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove `{}`", path.display()))?;
+            removed.push(path);
+        }
+    }
+
+    if removed.is_empty() {
+        bail!("installed mod `{}` was not found", request.name);
+    }
+    removed.sort();
+    write_remote_version_manifest(
+        &target.version_dir,
+        &target.alias,
+        &target.minecraft_version,
+        &target.alias,
+        &mods_dir,
+    )?;
+
+    Ok(UninstalledMod {
+        name: request.name.clone(),
+        minecraft_version: target.minecraft_version,
+        alias: target.alias,
+        removed,
     })
 }
 
@@ -3432,6 +3705,7 @@ struct ModrinthSearchHit {
 
 #[derive(Debug, Deserialize)]
 struct ModrinthVersion {
+    version_number: String,
     files: Vec<ModrinthFile>,
 }
 
@@ -4968,12 +5242,24 @@ fn write_tested_mod_output(tested: &TestedMod, stdout: &mut impl Write) -> Resul
 
 fn write_searched_mods_output(mods: &[SearchedMod], stdout: &mut impl Write) -> Result<()> {
     for found in mods {
+        let versions = if found.versions.is_empty() {
+            String::new()
+        } else {
+            format!(" - versions: {}", found.versions.join(", "))
+        };
         writeln!(
             stdout,
-            "{} ({}) - {}",
-            found.title, found.slug, found.description
+            "{} ({}) - {}{}",
+            found.title, found.slug, found.description, versions
         )
         .context("failed to write searched mod output")?;
+    }
+    Ok(())
+}
+
+fn write_listed_mods_output(mods: &[String], stdout: &mut impl Write) -> Result<()> {
+    for name in mods {
+        writeln!(stdout, "{name}").context("failed to write listed mods output")?;
     }
     Ok(())
 }
@@ -4990,13 +5276,25 @@ fn write_downloaded_mod_output(downloaded: &DownloadedMod, stdout: &mut impl Wri
     .context("failed to write downloaded mod output")
 }
 
+fn write_uninstalled_mod_output(
+    uninstalled: &UninstalledMod,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    writeln!(
+        stdout,
+        "Uninstalled {} from Minecraft {} ({})",
+        uninstalled.name, uninstalled.minecraft_version, uninstalled.alias
+    )
+    .context("failed to write uninstalled mod output")
+}
+
 fn write_usage(cli_name: &str, stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "{}", usage_text(cli_name)).context("failed to write usage")
 }
 
 fn usage_text(cli_name: &str) -> String {
     format!(
-        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} search mod {{term}} [--version {{version-name}}]\n       {cli_name} download mod {{mod-name}} [--version {{version-name}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
+        "Usage: {cli_name} versions\n       {cli_name} install {{version}}|latest [--alias {{alias}}]\n       {cli_name} install mod [name] [--alias {{alias}}]\n       {cli_name} run {{version}} [--alias {{alias}}] [--open [host]] --username {{username}}\n       {cli_name} run --connect {{host}} --name {{name}} --username {{username}}\n       {cli_name} create mod {{name}} [--version {{minecraft-version}}] [--fabric {{fabric-version}}]\n       {cli_name} build mod [name] [--minor] [--major]\n       {cli_name} clone mod {{git-url}}\n       {cli_name} test mod [name]\n       {cli_name} search mod {{term}} [--version {{version-name}}] [--mod-versions]\n       {cli_name} download mod {{mod-name}} [--version {{version-name}}] [--mod-version {{version-name}}]\n       {cli_name} list mods [--version {{version-name}}]\n       {cli_name} uninstall mod {{mod-name}} [--version {{version-name}}]\n       {cli_name} configure-path\n       {cli_name} unset-path\n"
     )
 }
 
@@ -5976,6 +6274,7 @@ mod tests {
             &SearchModRequest {
                 term: "sodium".to_owned(),
                 version: None,
+                mod_versions: false,
             },
             &mut downloader,
         )
@@ -5987,6 +6286,7 @@ mod tests {
                 title: "Sodium".to_owned(),
                 slug: "sodium".to_owned(),
                 description: "Fast renderer".to_owned(),
+                versions: Vec::new(),
             }]
         );
     }
@@ -6008,6 +6308,7 @@ mod tests {
             &SearchModRequest {
                 term: "iris".to_owned(),
                 version: Some("26.1.2".to_owned()),
+                mod_versions: false,
             },
             &mut downloader,
         )
@@ -6039,12 +6340,50 @@ mod tests {
             &SearchModRequest {
                 term: "iris".to_owned(),
                 version: Some("latest".to_owned()),
+                mod_versions: false,
             },
             &mut downloader,
         )
         .unwrap();
 
         assert_eq!(mods[0].slug, "iris");
+    }
+
+    #[test]
+    fn search_modrinth_can_include_mod_versions() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        fs::create_dir_all(versions_folder.join("1.20.4/default")).unwrap();
+        let facets = percent_encode_query(r#"[["project_type:mod"],["versions:1.20.4"]]"#);
+        let search_url = format!("{MODRINTH_SEARCH_URL}?query=sodium&limit=10&facets={facets}");
+        let versions_url = format!(
+            "{MODRINTH_PROJECT_URL}/sodium/version?loaders={}&game_versions={}",
+            percent_encode_query(r#"["fabric"]"#),
+            percent_encode_query(r#"["1.20.4"]"#)
+        );
+        let mut downloader = FakeDownloader::new([
+            (
+                search_url.as_str(),
+                r#"{"hits":[{"title":"Sodium","slug":"sodium","description":"Fast render"}]}"#,
+            ),
+            (
+                versions_url.as_str(),
+                r#"[{"version_number":"0.5.8","files":[]},{"version_number":"0.5.7","files":[]}]"#,
+            ),
+        ]);
+
+        let mods = search_modrinth_mods(
+            &versions_folder,
+            &SearchModRequest {
+                term: "sodium".to_owned(),
+                version: None,
+                mod_versions: true,
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(mods[0].versions, vec!["0.5.8", "0.5.7"]);
     }
 
     #[test]
@@ -6066,16 +6405,17 @@ mod tests {
         let mut downloader = FakeDownloader::new([
             (
                 versions_url.as_str(),
-                r#"[{"files":[{"filename":"sodium.jar","url":"https://example.test/sodium.jar","primary":true}]}]"#,
+                r#"[{"version_number":"mc1.20.4-0.5.8","files":[{"filename":"sodium.jar","url":"https://example.test/sodium.jar","primary":true}]}]"#,
             ),
             ("https://example.test/sodium.jar", "fake jar"),
         ]);
 
         let downloaded = download_modrinth_mod(
             &versions_folder,
-            &SearchModRequest {
+            &DownloadModRequest {
                 term: "sodium".to_owned(),
                 version: None,
+                mod_version: None,
             },
             &mut downloader,
         )
@@ -6087,6 +6427,89 @@ mod tests {
             serde_yaml::from_str(&fs::read_to_string(version_dir.join("remote.yml")).unwrap())
                 .unwrap();
         assert!(manifest.mods.contains_key("sodium.jar"));
+    }
+
+    #[test]
+    fn downloads_specific_modrinth_mod_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        let version_dir = versions_folder.join("1.20.4/default");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(
+            version_dir.join("default.json"),
+            r#"{"downloads":{},"libraries":[{"name":"net.fabricmc:fabric-loader:0.19.3"}]}"#,
+        )
+        .unwrap();
+        let versions_url = format!(
+            "{MODRINTH_PROJECT_URL}/sodium/version?loaders={}&game_versions={}",
+            percent_encode_query(r#"["fabric"]"#),
+            percent_encode_query(r#"["1.20.4"]"#)
+        );
+        let mut downloader = FakeDownloader::new([
+            (
+                versions_url.as_str(),
+                r#"[{"version_number":"0.5.7","files":[{"filename":"old.jar","url":"https://example.test/old.jar","primary":true}]},{"version_number":"0.5.8","files":[{"filename":"new.jar","url":"https://example.test/new.jar","primary":true}]}]"#,
+            ),
+            ("https://example.test/new.jar", "new jar"),
+        ]);
+
+        let downloaded = download_modrinth_mod(
+            &versions_folder,
+            &DownloadModRequest {
+                term: "sodium".to_owned(),
+                version: None,
+                mod_version: Some("0.5.8".to_owned()),
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(downloaded.destination, version_dir.join("mods/new.jar"));
+        assert_eq!(fs::read(&downloaded.destination).unwrap(), b"new jar");
+    }
+
+    #[test]
+    fn lists_and_uninstalls_installed_mods() {
+        let repo = tempfile::tempdir().unwrap();
+        let versions_folder = repo.path().join("versions");
+        let version_dir = versions_folder.join("1.20.4/default");
+        let mods_dir = version_dir.join("mods");
+        fs::create_dir_all(&mods_dir).unwrap();
+        fs::write(
+            version_dir.join("default.json"),
+            r#"{"downloads":{},"libraries":[{"name":"net.fabricmc:fabric-loader:0.19.3"}]}"#,
+        )
+        .unwrap();
+        fs::write(mods_dir.join("sodium-0.5.8.jar"), "sodium").unwrap();
+        fs::write(mods_dir.join("iris.jar"), "iris").unwrap();
+        let mut downloader = FakeDownloader::new([]);
+
+        let mods = list_installed_mods(
+            &versions_folder,
+            &ListModsRequest { version: None },
+            &mut downloader,
+        )
+        .unwrap();
+        assert_eq!(mods, vec!["iris.jar", "sodium-0.5.8.jar"]);
+
+        let uninstalled = uninstall_mod(
+            &versions_folder,
+            &UninstallModRequest {
+                name: "sodium".to_owned(),
+                version: None,
+            },
+            &mut downloader,
+        )
+        .unwrap();
+
+        assert_eq!(uninstalled.removed, vec![mods_dir.join("sodium-0.5.8.jar")]);
+        assert!(!mods_dir.join("sodium-0.5.8.jar").exists());
+        assert!(mods_dir.join("iris.jar").exists());
+        let manifest: RemoteVersionManifest =
+            serde_yaml::from_str(&fs::read_to_string(version_dir.join("remote.yml")).unwrap())
+                .unwrap();
+        assert!(!manifest.mods.contains_key("sodium-0.5.8.jar"));
+        assert!(manifest.mods.contains_key("iris.jar"));
     }
 
     #[test]
