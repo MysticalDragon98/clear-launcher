@@ -4187,7 +4187,7 @@ fn substitute_launch_argument(argument: &str, context: &LaunchArgumentContext<'_
         ("${assets_root}", path_to_string(&assets_root)),
         ("${assets_index_name}", context.asset_index_name.to_owned()),
         ("${auth_uuid}", context.offline_uuid.clone()),
-        ("${auth_access_token}", "0".to_owned()),
+        ("${auth_access_token}", String::new()),
         ("${user_type}", "legacy".to_owned()),
         ("${version_type}", context.version_type.to_owned()),
         ("${user_properties}", "{}".to_owned()),
@@ -7151,7 +7151,14 @@ mod tests {
         );
         assert!(command.args.contains(&"Player_1".to_owned()));
         assert!(command.args.contains(&offline_player_uuid("Player_1")));
-        assert!(command.args.contains(&"0".to_owned()));
+        let access_token_index = command
+            .args
+            .iter()
+            .position(|argument| argument == "--accessToken")
+            .unwrap()
+            + 1;
+        assert_eq!(command.args[access_token_index], "");
+        assert!(!command.args.contains(&"0".to_owned()));
         assert!(command.args.contains(&"legacy".to_owned()));
         assert!(!command.args.contains(&"--demo".to_owned()));
         let classpath_index = command
